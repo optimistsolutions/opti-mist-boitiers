@@ -1,0 +1,13 @@
+name: controle
+on: [push, pull_request]
+jobs:
+  controle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntaxe Python
+        run: python3 -m py_compile $(git ls-files '*.py')
+      - name: Aucun secret ni nom de client
+        run: |
+          ! git grep -n -I -i -E "moablaou|toe-ernest|hien-herve|creuset|anac-|kam-victor|ghp_|github_pat_|BEGIN (RSA|OPENSSH)|direct_jeton *= *[A-Za-z0-9]{16,}|jeton *= *[A-Za-z0-9]{16,}|script\.google\.com/macros/s/" -- . ':!.github/workflows/controle.yml'
