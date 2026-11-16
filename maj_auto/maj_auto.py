@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OPTI-MIST SOLUTIONS - Mise a jour automatique des boitiers (v1.0, GO S.S. 15/11/2026 22h35)
+OPTI-MIST SOLUTIONS - Mise a jour automatique des boitiers (v1.1 du 16/11/2026 : retour arriere aussi si le test depasse le delai ; v1.0 GO S.S. 15/11/2026 22h35)
 
 Le boitier cherche lui-meme ses mises a jour, une fois par jour. AUCUN port ouvert, aucune connexion entrante :
 le boitier sort vers internet comme pour l'envoi de ses releves.
@@ -32,7 +32,7 @@ import sys
 import tempfile
 import urllib.request
 
-VERSION = "1.0 (15/11/2026)"
+VERSION = "1.1 (16/11/2026)"
 CONF = "/etc/opti-maj/maj.conf"
 JOURNAL = "/var/lib/opti-maj/journal.log"
 
@@ -121,6 +121,7 @@ def appliquer(cfg, essai):
             continue
         tmp = tempfile.NamedTemporaryFile(delete=False, dir=os.path.dirname(cible))
         tmp.close()
+        remplace = False
         try:
             urllib.request.urlretrieve(url, tmp.name)
             recu = sha(tmp.name)
@@ -135,6 +136,7 @@ def appliquer(cfg, essai):
             mode = os.stat(cible).st_mode if os.path.exists(cible) else 0o755
             os.chmod(tmp.name, mode & 0o777)
             os.replace(tmp.name, cible)
+            remplace = True
             ok = True
             if comp.get("test"):
                 r = subprocess.run(comp["test"], shell=True, capture_output=True, text=True, timeout=240)
@@ -148,8 +150,13 @@ def appliquer(cfg, essai):
                 log("%s : version %s installee (empreinte %s), test OK." % (nom, a.get("version", "?"), attendu[:12]))
                 bilan.append("%s %s ok" % (nom, a.get("version", "?")))
         except Exception as e:
-            log("%s : echec (%s) -> rien n'est change." % (nom, type(e).__name__))
-            bilan.append("%s echec" % nom)
+            if remplace and os.path.exists(cible + ".precedent"):   # v1.1 (audit N13 add. 2, B#2) : retour aussi si le test depasse le delai ou plante
+                shutil.copy2(cible + ".precedent", cible)
+                log("%s : echec du test (%s) apres installation -> RETOUR a la version precedente." % (nom, type(e).__name__))
+                bilan.append("%s retour arriere" % nom)
+            else:
+                log("%s : echec (%s) -> rien n'est change." % (nom, type(e).__name__))
+                bilan.append("%s echec" % nom)
         finally:
             if os.path.exists(tmp.name):
                 os.remove(tmp.name)
