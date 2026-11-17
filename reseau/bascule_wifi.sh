@@ -1,5 +1,8 @@
 #!/bin/bash
-# bascule_wifi.sh v1.0 (17/11/2026, GO S.S. 10h21) — OPTI-MIST SOLUTIONS
+# bascule_wifi.sh v1.1 (17/11/2026) — OPTI-MIST SOLUTIONS
+# v1.1 (17/11 10h53) : principal en câble (Ethernet) possible, cas OPTI-087 : la connexion principale est coupée
+#   avant d'activer le secours (sinon la route par le câble reste prioritaire), et le secours est coupé au retour.
+# v1.0 (17/11 10h21, GO S.S.) : 1re version, Wi-Fi principal et Wi-Fi de secours.
 # Bascule le Wi-Fi du boîtier entre le réseau PRINCIPAL et le réseau de SECOURS (routeur 4G d'un autre opérateur)
 # selon l'accès internet RÉEL, pas seulement la présence du Wi-Fi.
 # Pourquoi : le 16/11, la fibre du bureau est tombée ; le Wi-Fi de la maison restait allumé, donc NetworkManager
@@ -26,12 +29,14 @@ if [ "$actif" != "$SECOURS" ]; then
   n=$(( $(cat "$ECHECS" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$ECHECS"
   [ "$n" -lt 3 ] && { log "internet absent sur ${actif:-aucune connexion} ($n/3)"; exit 0; }
   log "internet absent 3 fois de suite : bascule sur $SECOURS"
-  if nmcli con up "$SECOURS" >/dev/null 2>&1 && sleep 15 && internet; then log "en ligne sur $SECOURS"; else log "ECHEC sur $SECOURS : retour sur $PRINCIPAL"; nmcli con up "$PRINCIPAL" >/dev/null 2>&1; fi
+  nmcli con down "$PRINCIPAL" >/dev/null 2>&1   # v1.1 : indispensable si le principal est un câble
+  if nmcli con up "$SECOURS" >/dev/null 2>&1 && sleep 15 && internet; then log "en ligne sur $SECOURS"; else log "ECHEC sur $SECOURS : retour sur $PRINCIPAL"; nmcli con down "$SECOURS" >/dev/null 2>&1; nmcli con up "$PRINCIPAL" >/dev/null 2>&1; fi
   echo 0 > "$ECHECS"; date +%s > "$DEPUIS"
 else
   now=$(date +%s); last=$(cat "$DEPUIS" 2>/dev/null || echo 0)
   if [ $((now - last)) -lt 900 ]; then internet || log "pas d'internet non plus sur $SECOURS"; exit 0; fi
   date +%s > "$DEPUIS"
+  nmcli con down "$SECOURS" >/dev/null 2>&1   # v1.1
   if nmcli con up "$PRINCIPAL" >/dev/null 2>&1 && sleep 20 && internet; then log "internet revenu : retour sur $PRINCIPAL"; exit 0; fi
-  log "principal toujours sans internet : maintien sur $SECOURS"; nmcli con up "$SECOURS" >/dev/null 2>&1
+  log "principal toujours sans internet : maintien sur $SECOURS"; nmcli con down "$PRINCIPAL" >/dev/null 2>&1; nmcli con up "$SECOURS" >/dev/null 2>&1
 fi
