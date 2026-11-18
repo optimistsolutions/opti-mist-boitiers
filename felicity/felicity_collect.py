@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OPTI-MIST SOLUTIONS - Pilote Felicity IVEM (RS232, Modbus RTU 9600 8N1) - v1.4 du 13/11/2026
+OPTI-MIST SOLUTIONS - Pilote Felicity IVEM (RS232, Modbus RTU 9600 8N1) - v1.5 du 18/11/2026
+v1.5 (GO S.S. 18/11 19h02) : INTERNET DE SECOURS. Le direct porte aussi secours (1 = boitier sur le Wi-Fi de secours 4G,
+0 = principal ; lu dans /var/lib/opti-mist/netplan_mode ecrit par bascule_netplan.sh) et secours_mo_jour / secours_mo_mois
+(donnees consommees sur le secours, compteurs de bascule_netplan v1.1). Rien n'est envoye si la bascule n'est pas installee.
 v1.4 (GO S.S. 13/11 14h45) : DIRECT. A chaque releve (5 min), le dernier releve part aussi vers le tableau de bord
 (carte "Boitiers en direct") si direct_url et direct_jeton sont renseignes dans envoi.conf. Un seul releve est garde
 la-bas (rien dans l'historique). Un echec du direct ne bloque ni le stockage ni l'envoi horaire.
@@ -271,6 +274,26 @@ def envoyer(rec):
     return "envoi=ok %d ligne(s)%s" % (envoyees, " dont %d de rattrapage" % (envoyees - 1) if envoyees > 1 else "")
 
 
+def etat_secours():
+    """v1.5 : mode de la bascule netplan et donnees consommees sur le secours (Mo). {} si la bascule n'est pas installee."""
+    d = "/var/lib/opti-mist"
+    try:
+        with open(os.path.join(d, "netplan_mode")) as f:
+            mode = f.read().strip()
+    except OSError:
+        return {}
+
+    def mo(suffixe):
+        try:
+            with open(os.path.join(d, "secours_octets_" + suffixe)) as f:
+                return round(int(f.read().strip() or 0) / 1048576, 1)
+        except (OSError, ValueError):
+            return 0
+    maint = dt.datetime.now()
+    return {"secours": 1 if mode == "secours" else 0,
+            "secours_mo_jour": mo(maint.strftime("%Y-%m-%d")), "secours_mo_mois": mo(maint.strftime("%Y-%m"))}
+
+
 def envoyer_direct(rec):
     """v1.4 : dernier releve -> carte "Boitiers en direct" du tableau de bord (valeurs lues telles quelles)."""
     cfg = lire_envoi()
@@ -282,9 +305,9 @@ def envoyer_direct(rec):
     corps = {"jeton": cfg["direct_jeton"], "direct": {
         "code": CODE, "horodatage": rec["horodatage"], "statut": rec.get("statut", ""),
         "mode": "batterie" if bat < 0 else ("reseau" if reseau else "-"),
-        "valeurs": {k: v[k] for k in ("batterie_tension_v", "batterie_soc_pct", "batterie_courant_a", "batterie_puissance_w",
-                                      "charge_puissance_w", "charge_apparente_va", "charge_pct", "reseau_tension_v",
-                                      "reseau_frequence_hz", "sortie_tension_v", "pv_w") if k in v}}}
+        "valeurs": dict({k: v[k] for k in ("batterie_tension_v", "batterie_soc_pct", "batterie_courant_a", "batterie_puissance_w",
+                                           "charge_puissance_w", "charge_apparente_va", "charge_pct", "reseau_tension_v",
+                                           "reseau_frequence_hz", "sortie_tension_v", "pv_w") if k in v}, **etat_secours())}}
     try:
         req = urllib.request.Request(cfg["direct_url"], data=json.dumps(corps).encode(),
                                      headers={"Content-Type": "application/json"})

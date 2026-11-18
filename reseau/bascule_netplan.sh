@@ -1,5 +1,10 @@
 #!/bin/bash
-# bascule_netplan.sh v1.0 (18/11/2026, GO S.S. 11h46) — OPTI-MIST SOLUTIONS
+# bascule_netplan.sh v1.1 (18/11/2026, GO S.S. 19h02) — OPTI-MIST SOLUTIONS
+# v1.1 : COMPTEUR DE DONNÉES DU SECOURS. À chaque passage (2 min), les octets reçus + envoyés par l'interface Wi-Fi depuis le
+#   passage précédent sont ajoutés au compteur du jour et du mois quand le mode est « secours » (forfait 4G). Fichiers :
+#   /var/lib/opti-mist/secours_octets_AAAA-MM-JJ et secours_octets_AAAA-MM (lus aussi par le collecteur Felicity v1.5,
+#   qui les envoie au tableau de bord : alerte du Veilleur au passage sur le secours). « etat » affiche Mo du jour et du mois.
+# v1.0 (18/11/2026, GO S.S. 11h46)
 # Version de bascule_wifi.sh pour les boîtiers dont le Wi-Fi est géré par netplan + systemd-networkd
 # (pas de NetworkManager, cas d'OPTI-061 constaté le 18/11 : « nmcli: command not found »).
 # Bascule le Wi-Fi du boîtier entre le réseau PRINCIPAL et le réseau de SECOURS selon l'accès internet RÉEL.
@@ -35,11 +40,31 @@ appliquer() {  # $1 = principal | secours
 }
 mode=$(cat "$MODE" 2>/dev/null || echo principal)
 
+# v1.1 — compteur de données du secours (interface Wi-Fi = première interface qui a un dossier « wireless »)
+IFACE=$(for i in /sys/class/net/*; do [ -d "$i/wireless" ] && basename "$i" && break; done)
+compter() {
+  [ -n "$IFACE" ] || return 0
+  local rx tx tot prec delta j m
+  rx=$(cat "/sys/class/net/$IFACE/statistics/rx_bytes" 2>/dev/null || echo 0)
+  tx=$(cat "/sys/class/net/$IFACE/statistics/tx_bytes" 2>/dev/null || echo 0)
+  tot=$((rx + tx)); prec=$(cat "$D/octets_dernier" 2>/dev/null || echo "$tot")
+  delta=$((tot - prec)); [ "$delta" -lt 0 ] && delta=$tot   # compteur remis à zéro (redémarrage)
+  echo "$tot" > "$D/octets_dernier"
+  [ "$mode" = secours ] || return 0
+  j="$D/secours_octets_$(date +%F)"; m="$D/secours_octets_$(date +%Y-%m)"
+  echo $(( $(cat "$j" 2>/dev/null || echo 0) + delta )) > "$j"
+  echo $(( $(cat "$m" 2>/dev/null || echo 0) + delta )) > "$m"
+  find "$D" -maxdepth 1 -name 'secours_octets_????-??-??' -mtime +40 -delete 2>/dev/null
+}
+mo() { echo $(( $(cat "$1" 2>/dev/null || echo 0) / 1048576 )); }
+
 case "${1:-}" in
-  etat) internet && i=oui || i=non; echo "mode=$mode internet=$i echecs=$(cat "$ECHECS" 2>/dev/null || echo 0)"; exit 0 ;;
+  etat) internet && i=oui || i=non
+        echo "mode=$mode internet=$i echecs=$(cat "$ECHECS" 2>/dev/null || echo 0) secours_mo_jour=$(mo "$D/secours_octets_$(date +%F)") secours_mo_mois=$(mo "$D/secours_octets_$(date +%Y-%m)")"; exit 0 ;;
   principal|secours) log "forçage manuel : $1"; appliquer "$1"; echo 0 > "$ECHECS"; date +%s > "$ESSAI"; exit 0 ;;
 esac
 
+compter
 if [ "$mode" != secours ]; then
   if internet; then echo 0 > "$ECHECS"; exit 0; fi
   n=$(( $(cat "$ECHECS" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$ECHECS"
