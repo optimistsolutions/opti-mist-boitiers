@@ -13,4 +13,4 @@ Source de référence et historique complet : dépôt privé interne. Ce dépôt
 | sa_relais/ | Relais en lecture seule de sites équipés d'une plateforme de supervision tierce |
 | felicity/ | Collecteur pour convertisseurs à batterie |
 | maj_auto/ | Mise à jour automatique à double canal (approbation + fichiers), avec retour arrière |
-| reseau/ | Bascule Wi-Fi principal / secours selon l'accès internet réel (v1.1) |
+| reseau/ | Bascule Wi-Fi principal / secours selon l'accès internet réel : bascule_wifi.sh v1.1 (NetworkManager), bascule_netplan.sh v1.0 (netplan) |
