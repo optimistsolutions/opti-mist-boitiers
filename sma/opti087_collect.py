@@ -4,6 +4,13 @@
 OPTI-MIST SOLUTIONS - Collecte supervision site OPTI-087
 Lecture des onduleurs SMA (directement, ou par Modbus TCP du Data Manager) et envoi vers la plateforme.
 
+v1.9 (GO S.S. 22/11/2026 12h58) : EVENEMENTS 24 H et NUIT, toujours en lecture seule.
+  - Le DIRECT porte, par onduleur, le dernier evenement des 24 dernieres heures (ondN_evt24 = code, ondN_evt24_hhmm =
+    heure HHMM du site, ondN_evt24_nb = nombre sur 24 h). La plateforme les garde jusqu'a leur prise en compte
+    (encart « Evenements des 24 dernieres heures » du tableau de bord) : un defaut du matin reste visible le soir.
+  - Nuit (entre nuit_debut et nuit_fin, [site], 19 h et 6 h par defaut) : onduleurs en veille et non lus = statut NUIT
+    (et plus ONDULEURS_INJOIGNABLES) ; l'historique garde HORS LIGNE avec l'alerte « NUIT : ... boitier en ligne » :
+    les heures de nuit deviennent « non imputables » (boitier vivant, centrale a l'arret normal) au lieu d'« inconnues ».
 v1.8 (GO S.S. 15/11/2026 22h35) : JOURNAL D'EVENEMENTS et COMPTEUR, toujours en lecture seule.
   - Evenements : a chaque releve, dans la meme session Speedwire, le boitier lit le journal d'evenements de chaque
     onduleur depuis le dernier evenement connu (commande de lecture du journal, droit du compte configure). Les
@@ -63,7 +70,7 @@ import sys
 import urllib.request
 
 CONF_PATH = "/etc/opti087/opti087.conf"
-VERSION = "1.8 (15/11/2026)"
+VERSION = "1.9 (22/11/2026)"
 
 # ---------------------------------------------------------------------------
 # Registres SMA (profil SMA standard). A VALIDER SUR SITE avec --scan
@@ -189,6 +196,8 @@ def charger_conf(path):
         "unit_ond": ids,
         "dossier": s.get("dossier_donnees", "/var/lib/opti087"),
         "jours": s.getint("jours_conserves", 60),
+        "nuit_debut": s.getint("nuit_debut", 19),      # v1.9 : heure du site
+        "nuit_fin": s.getint("nuit_fin", 6),
         "url": c["envoi"].get("url", "").strip(),
         "jeton": c["envoi"].get("jeton", "").strip(),
         "direct_url": c["envoi"].get("direct_url", "").strip(),       # v1.3
@@ -241,7 +250,7 @@ def ligne_historique(rec, cfg):
             "site": cfg["code"], "pv_w": round(p) if (ok and p is not None) else "",
             "load_w": "", "batt_pct": "", "grid_w": "",      # non mesures sur ce site : jamais inventes
             "mode": "Grid" if ok else "-", "eco_fcfa": 0,
-            "statut": "OK" if ok else "HORS LIGNE", "alertes": (rec.get("alertes") or "")[:200]}
+            "statut": "OK" if ok else "HORS LIGNE", "alertes": (rec.get("alertes") or "")[:200]}   # v1.9 : nuit = HORS LIGNE + alerte NUIT
 
 
 def releves_par_heure(cfg, depuis):
@@ -331,6 +340,9 @@ def envoyer_direct(cfg, rec):
                 v[n + "_evt_nb"] = o["evt_nb"]
             if o.get("evt") is not None:
                 v[n + "_evt"] = o["evt"]
+            for s24 in ("evt24", "evt24_nb", "evt24_hhmm"):   # v1.9 : 24 dernieres heures
+                if o.get(s24) is not None:
+                    v[n + "_" + s24] = o[s24]
     cpt = rec.get("compteur") or {}                    # v1.8 : compteur SMA (ecoute passive)
     for k in ("import_w", "export_w", "import_kwh", "export_kwh"):
         if cpt.get(k) is not None:
@@ -667,6 +679,11 @@ def traiter_evenements(cfg, lus, etat):
             o["evt_nb"] = len(heure)
             if heure:
                 o["evt"] = sorted(heure)[-1][1]
+            o["evt24_nb"] = len(e["recents"])                # v1.9 : 24 dernieres heures
+            if e["recents"]:
+                t, code = sorted(e["recents"])[-1]
+                d = dt.datetime.fromtimestamp(t)
+                o["evt24"], o["evt24_hhmm"] = code, d.hour * 100 + d.minute
     json.dump(etat, open(os.path.join(cfg["dossier"], "evenements_etat.json"), "w"))
     try:   # 60 jours gardes
         lignes = open(chemin, encoding="utf-8").read().splitlines()
@@ -677,6 +694,12 @@ def traiter_evenements(cfg, lus, etat):
     except (OSError, ValueError):
         pass
     return nouveaux
+
+
+def est_nuit(cfg, maintenant=None):
+    """v1.9 : heure du site entre nuit_debut et nuit_fin (les onduleurs SMA s'endorment sans soleil)."""
+    h = (maintenant or dt.datetime.now()).hour
+    return h >= cfg["nuit_debut"] or h < cfg["nuit_fin"]
 
 
 def releve_onduleurs(cfg, rec):
@@ -712,7 +735,10 @@ def releve_onduleurs(cfg, rec):
     rec["centrale"] = {"puissance_ac_w": somme("puissance_ac_w"), "energie_jour_wh": somme("energie_jour_wh"),
                        "energie_totale_wh": somme("energie_totale_wh"), "onduleurs_lus": len(lus),
                        "onduleurs_attendus": len(ordre)}
-    rec["statut"] = "OK" if lus else "ONDULEURS_INJOIGNABLES"
+    rec["statut"] = "OK" if lus else ("NUIT" if est_nuit(cfg) else "ONDULEURS_INJOIGNABLES")   # v1.9
+    if rec["statut"] == "NUIT":
+        rec["alertes"] = "NUIT : onduleurs en veille, boitier en ligne"
+        return
     if absents:
         rec["alertes"] = "non lus : " + ", ".join(absents)
     defauts = [o["numero_serie"] for o in lus.values() if o.get("etat") not in (None, 307)]
