@@ -1,5 +1,5 @@
 #!/bin/sh
-# OPTI-MIST SOLUTIONS - Installation de la mise a jour automatique (v1.0, 15/11/2026)
+# OPTI-MIST SOLUTIONS - Installation de la mise a jour automatique (v1.1, 22/11/2026 : verification a 7h30 ET a 13h, demande S.S. ; v1.0, 15/11/2026)
 # A lancer en root depuis le dossier qui contient maj_auto.py :  sh install_maj_auto.sh OPTI-087   (ou OPTI-061)
 set -e
 [ "$(id -u)" = "0" ] || { echo "Lancer en root (sudo sh install_maj_auto.sh OPTI-0XX)"; exit 1; }
@@ -53,11 +53,12 @@ TimeoutStartSec=600
 EOS
 cat > /etc/systemd/system/opti-maj.timer <<'EOS'
 [Unit]
-Description=OPTI-MIST SOLUTIONS - recherche de mise a jour (tous les jours vers 13h, plus 10 min apres demarrage)
+Description=OPTI-MIST SOLUTIONS - recherche de mise a jour (vers 7h30 et 13h, plus 10 min apres demarrage)
 [Timer]
 OnBootSec=10min
+OnCalendar=*-*-* 07:30:00
 OnCalendar=*-*-* 13:00:00
-RandomizedDelaySec=20min
+RandomizedDelaySec=15min
 Persistent=true
 [Install]
 WantedBy=timers.target
