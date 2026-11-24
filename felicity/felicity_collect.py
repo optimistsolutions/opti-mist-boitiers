@@ -6,7 +6,7 @@ v1.7 (19/11, standard « zone isolee » GO S.S. 17/11, pour les NOUVEAUX boitier
   jours_conserves = 730    (stock local en jours ; defaut 60, 7 a 1000)
   rattrapage_jours = 90    (profondeur du rattrapage apres coupure ; defaut 7, 1 a 90)
 Au plus 20 lots de 48 lignes par passage (le reste part aux passages suivants). Absents = comportement v1.6 inchange (OPTI-061).
-v1.6 (GO S.S. 19/11 09h57) : PLUSIEURS CONVERTISSEURS EN PARALLELE et CODE DE SITE PARAMETRABLE (essais Saaba, CREUSET).
+v1.6 (GO S.S. 19/11 09h57) : PLUSIEURS CONVERTISSEURS EN PARALLELE et CODE DE SITE PARAMETRABLE (sites clients en essai).
 Dans envoi.conf (facultatif ; absent = comportement v1.5 d'OPTI-061, inchange) :
   code = OPTI-0xx          (code du site ; defaut OPTI-061)
   port = /dev/ttyUSB0      (port serie ; defaut /dev/ttyUSB0)
