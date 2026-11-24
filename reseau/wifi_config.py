@@ -41,6 +41,12 @@ v1.0h (23/11 12h35, GO S.S. 12h31, revue securite) : (1) en mode INFO, changer l
   pour le saisir, sans affichage) ; 5 codes faux -> formulaire bloque jusqu'a la fermeture. Boitier neuf (CONFIG) :
   inchange, pas de code. (2) Internet absent depuis plus de 2 h (credit epuise) : INFO 15 min toutes les 30 min
   (au lieu de 10 min toutes les 40 min).
+v1.0j (24/11 20h30, GO S.S., test E du 24/11 sur opti-098) : ECRITURES FORCEES SUR LE DISQUE. Test E (M) : coupure ~20 s
+  apres « Le boitier se connecte » -> ni la copie d'avant ni le nouveau Wi-Fi n'etaient sur le disque (aucun fsync : Linux
+  garde les ecritures quelques secondes en memoire) ; le boitier est reparti sur l'ancien Wi-Fi par hasard, sans la ligne
+  « ESSAI INTERROMPU ». Risque : une ecriture survit et pas l'autre (cas probable du 23/11 17:06). Desormais : copie d'avant
+  ecrite ET forcee sur le disque (fsync fichier + dossier) AVANT le nouveau Wi-Fi ; nouveau Wi-Fi et fichier netplan forces
+  aussi ; journal « essai du Wi-Fi X lance » au debut de chaque essai (sans mot de passe).
 v1.0i (23/11 18h28, GO S.S., tests A-B-C du 23/11 sur opti-098) :
   (1) ESSAI INTERROMPU : a 17:06 un essai de Wi-Fi (mode INFO) a ete coupe par une coupure de courant avant la fin des
       120 s ; le nouveau mot de passe etait deja enregistre et l'ancien (bon) perdu -> 24 refus WRONG_KEY a 17:50 (M, journal).
@@ -103,7 +109,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "wifi_config 1.0i"
+VERSION = "wifi_config 1.0j"
 IFACE = "wlan0"
 AP_IP = "10.42.0.1"
 CONF = "/etc/opti061"
@@ -258,13 +264,28 @@ def connus_tous():
     return [c["ssid"] for c in clients()] + atelier()
 
 
-def ecrire_clients(liste):
-    os.makedirs(CONF, exist_ok=True)
-    tmp = CLIENTS + ".tmp"
+def ecrire_sur(chemin, texte):
+    """v1.0j : ecriture atomique ET forcee sur le disque (fichier tmp + fsync, remplacement, fsync du dossier), root 600."""
+    tmp = chemin + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
-        json.dump(liste, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, CLIENTS)
+        f.write(texte)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, chemin)
+    try:
+        d = os.open(os.path.dirname(chemin) or ".", os.O_RDONLY)
+        try:
+            os.fsync(d)
+        finally:
+            os.close(d)
+    except OSError:
+        pass
+
+
+def ecrire_clients(liste):
+    os.makedirs(CONF, exist_ok=True)
+    ecrire_sur(CLIENTS, json.dumps(liste, ensure_ascii=False, indent=1))     # v1.0j
     # netplan : YAML accepte les chaines JSON entre guillemets -> json.dumps protege les caracteres speciaux
     if liste:
         lignes = ["# OPTI-MIST SOLUTIONS - genere par wifi_config.py, ne pas modifier a la main", "network:",
@@ -279,10 +300,7 @@ def ecrire_clients(liste):
                     lignes.append("          hidden: true")
             else:                                   # Wi-Fi ouvert : netplan attend une table vide
                 lignes.append("        %s: {}" % json.dumps(c["ssid"], ensure_ascii=False))
-        fd = os.open(NETPLAN + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write("\n".join(lignes) + "\n")
-        os.replace(NETPLAN + ".tmp", NETPLAN)
+        ecrire_sur(NETPLAN, "\n".join(lignes) + "\n")                        # v1.0j
     elif os.path.exists(NETPLAN):
         os.remove(NETPLAN)
 
@@ -837,10 +855,7 @@ def a_internet():
 def garder_avant(anciens):
     """v1.0i : copie de la liste d'avant l'essai (root 600), retablie si l'essai est interrompu (coupure, redemarrage)."""
     os.makedirs(CONF, exist_ok=True)
-    fd = os.open(ESSAI_AVANT + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump({"pid": os.getpid(), "anciens": anciens}, f, ensure_ascii=False)
-    os.replace(ESSAI_AVANT + ".tmp", ESSAI_AVANT)
+    ecrire_sur(ESSAI_AVANT, json.dumps({"pid": os.getpid(), "anciens": anciens}, ensure_ascii=False))   # v1.0j : force
 
 
 def essai_vivant(pid):
@@ -854,6 +869,10 @@ def essai_vivant(pid):
 def fin_essai():
     if os.path.exists(ESSAI_AVANT):
         os.remove(ESSAI_AVANT)
+        try:
+            os.sync()                                   # v1.0j
+        except OSError:
+            pass
 
 
 def retablir_essai_interrompu():
@@ -885,7 +904,8 @@ def essayer(ap, ssid, mdp):
     anciens = clients()
     nouveaux = [c for c in anciens if c["ssid"] != ssid] + [{"ssid": ssid, "mdp": mdp, "masque": ETAT.get("masque", False),
                                                             "ajoute": time.strftime("%Y-%m-%d %H:%M")}]
-    garder_avant(anciens)
+    garder_avant(anciens)                      # v1.0j : sur le disque AVANT le nouveau Wi-Fi
+    log("essai du Wi-Fi « %s » lance (%d s au plus) ; Wi-Fi d'avant gardes" % (ssid, ESSAI_S))
     ecrire_clients(nouveaux)
     ap.fermer()
     t0 = time.time()
