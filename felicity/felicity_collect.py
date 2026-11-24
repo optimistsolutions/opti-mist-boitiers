@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OPTI-MIST SOLUTIONS - Pilote Felicity IVEM (RS232, Modbus RTU 9600 8N1) - v1.5 du 18/11/2026
+OPTI-MIST SOLUTIONS - Pilote Felicity IVEM (RS232/RS485, Modbus RTU 9600 8N1) - v1.7 du 19/11/2026
+v1.7 (19/11, standard « zone isolee » GO S.S. 17/11, pour les NOUVEAUX boitiers) : dans envoi.conf, facultatif :
+  jours_conserves = 730    (stock local en jours ; defaut 60, 7 a 1000)
+  rattrapage_jours = 90    (profondeur du rattrapage apres coupure ; defaut 7, 1 a 90)
+Au plus 20 lots de 48 lignes par passage (le reste part aux passages suivants). Absents = comportement v1.6 inchange (OPTI-061).
+v1.6 (GO S.S. 19/11 09h57) : PLUSIEURS CONVERTISSEURS EN PARALLELE et CODE DE SITE PARAMETRABLE (essais Saaba, CREUSET).
+Dans envoi.conf (facultatif ; absent = comportement v1.5 d'OPTI-061, inchange) :
+  code = OPTI-0xx          (code du site ; defaut OPTI-061)
+  port = /dev/ttyUSB0      (port serie ; defaut /dev/ttyUSB0)
+  esclaves = 1,2,3         (adresses Modbus des convertisseurs en parallele sur le meme cable ; defaut 1)
+Les convertisseurs en parallele se lisent sur un seul cable (D, S.S. 19/11). Chaque convertisseur est lu a son adresse ;
+le releve additionne production (pv_w), charge (charge_puissance_w, charge_apparente_va) et prend la batterie, le reseau et
+la sortie au premier convertisseur qui repond (parc batterie commun). convertisseurs_lus / convertisseurs_attendus disent
+combien ont repondu ; le detail par convertisseur est garde dans le releve local. Toujours LECTURE SEULE (fonction 03).
 v1.5 (GO S.S. 18/11 19h02) : INTERNET DE SECOURS. Le direct porte aussi secours (1 = boitier sur le Wi-Fi de secours 4G,
 0 = principal ; lu dans /var/lib/opti-mist/netplan_mode ecrit par bascule_netplan.sh) et secours_mo_jour / secours_mo_mois
 (donnees consommees sur le secours, compteurs de bascule_netplan v1.1). Rien n'est envoye si la bascule n'est pas installee.
@@ -27,6 +40,35 @@ Usage : felicity_collect.py --once | --show     (port /dev/ttyUSB0, esclave 1)
 import json, os, sys, termios, time, tty, select, urllib.request, datetime as dt
 
 PORT, SLAVE, CODE = "/dev/ttyUSB0", 1, "OPTI-061"
+ESCLAVES = [1]
+SOMMES = ("pv_w", "pv1_puissance_w", "pv2_puissance_w", "charge_puissance_w", "charge_apparente_va")   # v1.6 : additionnes
+
+
+def regler():
+    """v1.6 : code, port et esclaves lus dans envoi.conf (absents = valeurs v1.5)."""
+    global PORT, CODE, ESCLAVES
+    cfg = lire_envoi_brut()
+    CODE = cfg.get("code") or CODE
+    PORT = cfg.get("port") or PORT
+    try:
+        e = [int(x) for x in str(cfg.get("esclaves") or "").replace(" ", "").split(",") if x]
+        if e and all(1 <= x <= 247 for x in e):
+            ESCLAVES = e
+    except ValueError:
+        pass
+    global JOURS, RATTRAPAGE_H                      # v1.7 : standard « zone isolee »
+    try:
+        j = int(cfg.get("jours_conserves") or 0)
+        if 7 <= j <= 1000:
+            JOURS = j
+    except ValueError:
+        pass
+    try:
+        r = int(cfg.get("rattrapage_jours") or 0)
+        if 1 <= r <= 90:
+            RATTRAPAGE_H = r * 24
+    except ValueError:
+        pass
 DATA = os.environ.get("OPTI_DATA", "/var/lib/opti061")
 JOURS = 60
 
@@ -77,10 +119,11 @@ def ouvrir():
     return fd
 
 
-def lire(fd, addr, n=16, essais=4):
-    req = bytes([SLAVE, 3, addr >> 8, addr & 0xFF, 0, n])
+def lire(fd, addr, n=16, essais=4, esclave=None):
+    sl = SLAVE if esclave is None else esclave
+    req = bytes([sl, 3, addr >> 8, addr & 0xFF, 0, n])
     req += crc16(req)
-    entete = bytes([SLAVE, 3, 2 * n])
+    entete = bytes([sl, 3, 2 * n])
     for _ in range(essais):
         termios.tcflush(fd, termios.TCIOFLUSH)
         os.write(fd, req)
@@ -100,27 +143,7 @@ def lire(fd, addr, n=16, essais=4):
     return None
 
 
-def releve():
-    rec = {"site": CODE, "horodatage": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
-           "version": "felicity 1.4"}
-    try:
-        fd = ouvrir()
-        time.sleep(0.5)                       # laisser la liaison se stabiliser
-        lire(fd, 0x1100, 1, 1)                # premier echange de reveil, ignore
-        brut = {}
-        for b in BLOCS:
-            v = lire(fd, b)
-            if v is not None:
-                brut["%04X" % b] = v
-            time.sleep(0.05)
-        os.close(fd)
-    except OSError as e:
-        rec["statut"] = "PORT_INDISPONIBLE"
-        rec["erreur"] = str(e)
-        return rec
-    if not brut:
-        rec["statut"] = "CONVERTISSEUR_MUET"
-        return rec
+def decoder(brut):
     val = {}
     for nom, a, signe, div, _ in CARTE:
         bloc = "%04X" % (a & 0xFFF0)
@@ -131,9 +154,50 @@ def releve():
             val[nom] = x / div if div != 1 else x
     if "pv1_puissance_w" in val or "pv2_puissance_w" in val:   # v1.4 : production solaire totale (C)
         val["pv_w"] = (val.get("pv1_puissance_w") or 0) + (val.get("pv2_puissance_w") or 0)
+    return val
+
+
+def releve():
+    rec = {"site": CODE, "horodatage": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+           "version": "felicity 1.6"}
+    bruts = {}
+    try:
+        fd = ouvrir()
+        time.sleep(0.5)                       # laisser la liaison se stabiliser
+        for sl in ESCLAVES:
+            lire(fd, 0x1100, 1, 1, sl)        # premier echange de reveil, ignore
+            brut = {}
+            for b in BLOCS:
+                v = lire(fd, b, esclave=sl)
+                if v is not None:
+                    brut["%04X" % b] = v
+                time.sleep(0.05)
+            if brut:
+                bruts[sl] = brut
+        os.close(fd)
+    except OSError as e:
+        rec["statut"] = "PORT_INDISPONIBLE"
+        rec["erreur"] = str(e)
+        return rec
+    if not bruts:
+        rec["statut"] = "CONVERTISSEUR_MUET"
+        return rec
+    par = {sl: decoder(b) for sl, b in bruts.items()}
+    premier = par[sorted(par)[0]]
+    val = dict(premier)                       # batterie, reseau, sortie : premier convertisseur qui repond
+    if len(ESCLAVES) > 1:
+        for k in SOMMES:                      # v1.6 : production et charge additionnees
+            xs = [p[k] for p in par.values() if p.get(k) is not None]
+            if xs:
+                val[k] = sum(xs)
+        val["convertisseurs_lus"] = len(par)
+        val["convertisseurs_attendus"] = len(ESCLAVES)
+        rec["par_convertisseur"] = {str(sl): par[sl] for sl in sorted(par)}
+        rec["brut"] = {str(sl): bruts[sl] for sl in sorted(bruts)}
+    else:
+        rec["brut"] = bruts[sorted(bruts)[0]]   # v1.5 : meme forme qu'avant pour un seul convertisseur
     rec["statut"] = "OK"
     rec["valeurs"] = val
-    rec["brut"] = brut
     return rec
 
 
@@ -162,6 +226,18 @@ def sauver(rec):
 ENVOI_CONF = "/etc/opti061/envoi.conf"
 
 
+def lire_envoi_brut():
+    cfg = {}
+    try:
+        for ligne in open(ENVOI_CONF, encoding="utf-8"):
+            if "=" in ligne and not ligne.strip().startswith("#"):
+                k, v = ligne.split("=", 1)
+                cfg[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return cfg
+
+
 def lire_envoi():
     cfg = {"url": "", "site": CODE, "periode_min": "60", "alertes": "non", "direct_url": "", "direct_jeton": ""}
     try:
@@ -187,6 +263,7 @@ def categorie(v, ok):
 
 RATTRAPAGE_H = 168      # 7 jours au plus
 LOT = 48                # lignes par envoi
+MAX_LOTS = 20           # v1.7 : au plus 20 lots par passage (le reste au passage suivant)
 
 
 def ligne_historique(rec, cfg):
@@ -258,6 +335,7 @@ def envoyer(rec):
     if not a_envoyer:
         return "envoi=rien"
     envoyees = 0
+    a_envoyer = a_envoyer[:LOT * MAX_LOTS]        # v1.7
     for i in range(0, len(a_envoyer), LOT):
         lot = a_envoyer[i:i + LOT]
         try:
@@ -307,7 +385,8 @@ def envoyer_direct(rec):
         "mode": "batterie" if bat < 0 else ("reseau" if reseau else "-"),
         "valeurs": dict({k: v[k] for k in ("batterie_tension_v", "batterie_soc_pct", "batterie_courant_a", "batterie_puissance_w",
                                            "charge_puissance_w", "charge_apparente_va", "charge_pct", "reseau_tension_v",
-                                           "reseau_frequence_hz", "sortie_tension_v", "pv_w") if k in v}, **etat_secours())}}
+                                           "reseau_frequence_hz", "sortie_tension_v", "pv_w",
+                                           "convertisseurs_lus", "convertisseurs_attendus") if k in v}, **etat_secours())}}
     try:
         req = urllib.request.Request(cfg["direct_url"], data=json.dumps(corps).encode(),
                                      headers={"Content-Type": "application/json"})
@@ -318,6 +397,7 @@ def envoyer_direct(rec):
 
 
 def main():
+    regler()
     if "--show" in sys.argv:
         p = os.path.join(DATA, "dernier.json")
         if not os.path.exists(p):
@@ -326,6 +406,8 @@ def main():
         print(d["horodatage"], d["statut"])
         for k, v in (d.get("valeurs") or {}).items():
             print("  %-22s %s" % (k, v))
+        for sl, p in (d.get("par_convertisseur") or {}).items():   # v1.6
+            print("  convertisseur %s : pv=%s W charge=%s W batterie=%s %%" % (sl, p.get("pv_w"), p.get("charge_puissance_w"), p.get("batterie_soc_pct")))
         return
     rec = releve()
     sauver(rec)
@@ -333,6 +415,8 @@ def main():
         rec["direct"] = envoyer_direct(rec)
         rec["envoi"] = envoyer(rec)
     v = rec.get("valeurs", {})
+    if v.get("convertisseurs_attendus"):   # v1.6
+        print("site=%s convertisseurs lus %s/%s" % (CODE, v.get("convertisseurs_lus"), v.get("convertisseurs_attendus")))
     print("%s %s batterie=%s V %s %% charge=%s W pv=%s W (%s + %s) reseau=%s V" % (
         rec["horodatage"], rec["statut"], v.get("batterie_tension_v"), v.get("batterie_soc_pct"),
         v.get("charge_puissance_w"), v.get("pv_w"), v.get("pv1_puissance_w"), v.get("pv2_puissance_w"), v.get("reseau_tension_v")), rec.get("direct", ""), rec.get("envoi", ""))
