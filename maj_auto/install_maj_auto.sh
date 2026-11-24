@@ -1,5 +1,6 @@
 #!/bin/sh
-# OPTI-MIST SOLUTIONS - Installation de la mise a jour automatique (v1.1, 22/11/2026 : verification a 7h30 ET a 13h, demande S.S. ; v1.0, 15/11/2026)
+# OPTI-MIST SOLUTIONS - Installation de la mise a jour automatique (v1.2, 24/11/2026 : tout nouveau boitier Felicity OPTI-XXX,
+#   composants felicity_collect.py + wifi_config.py, GO S.S. 24/11 « on fait tout aujourd'hui » ; v1.1, 22/11/2026 : 7h30 ET 13h ; v1.0, 15/11/2026)
 # A lancer en root depuis le dossier qui contient maj_auto.py :  sh install_maj_auto.sh OPTI-087   (ou OPTI-061)
 set -e
 [ "$(id -u)" = "0" ] || { echo "Lancer en root (sudo sh install_maj_auto.sh OPTI-0XX)"; exit 1; }
@@ -39,7 +40,25 @@ chemin = /opt/opti061/felicity_collect.py
 test = /usr/bin/python3 /opt/opti061/felicity_collect.py --show >/dev/null
 EOC
   ;;
-  *) echo "Usage : sh install_maj_auto.sh OPTI-087 | OPTI-061"; exit 1 ;;
+  OPTI-[0-9][0-9][0-9]) cat > /etc/opti-maj/maj.conf <<EOC
+[general]
+code = $CODE
+depot_url = $DEPOT
+fichier_envoi = /etc/opti061/envoi.conf
+section_envoi =
+
+[composant:felicity_collect.py]
+source = felicity/felicity_collect.py
+chemin = /opt/opti061/felicity_collect.py
+test = /usr/bin/python3 /opt/opti061/felicity_collect.py --show >/dev/null
+
+[composant:wifi_config.py]
+source = reseau/wifi_config.py
+chemin = /opt/opti061/wifi_config.py
+test = /usr/bin/python3 -m py_compile /opt/opti061/wifi_config.py
+EOC
+  ;;
+  *) echo "Usage : sh install_maj_auto.sh OPTI-087 | OPTI-061 | OPTI-XXX (nouveau boitier Felicity)"; exit 1 ;;
 esac
 chmod 600 /etc/opti-maj/maj.conf
 cat > /etc/systemd/system/opti-maj.service <<'EOS'
