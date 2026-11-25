@@ -1,5 +1,6 @@
 #!/bin/sh
-# OPTI-MIST SOLUTIONS - Installation de la mise a jour automatique (v1.2, 24/11/2026 : tout nouveau boitier Felicity OPTI-XXX,
+# OPTI-MIST SOLUTIONS - Installation de la mise a jour automatique (v1.3, 25/11/2026 : boitier universel -> composant
+#   mpp_collect.py ajoute si le lecteur universel est installe (/opt/opti061/mpp_collect.py), GO S.S. 25/11 ; v1.2, 24/11/2026 : tout nouveau boitier Felicity OPTI-XXX,
 #   composants felicity_collect.py + wifi_config.py, GO S.S. 24/11 « on fait tout aujourd'hui » ; v1.1, 22/11/2026 : 7h30 ET 13h ; v1.0, 15/11/2026)
 # A lancer en root depuis le dossier qui contient maj_auto.py :  sh install_maj_auto.sh OPTI-087   (ou OPTI-061)
 set -e
@@ -57,6 +58,14 @@ source = reseau/wifi_config.py
 chemin = /opt/opti061/wifi_config.py
 test = /usr/bin/python3 -m py_compile /opt/opti061/wifi_config.py
 EOC
+  if [ -f /opt/opti061/mpp_collect.py ]; then cat >> /etc/opti-maj/maj.conf <<EOC
+
+[composant:mpp_collect.py]
+source = mpp/mpp_collect.py
+chemin = /opt/opti061/mpp_collect.py
+test = /usr/bin/python3 -m py_compile /opt/opti061/mpp_collect.py
+EOC
+  fi
   ;;
   *) echo "Usage : sh install_maj_auto.sh OPTI-087 | OPTI-061 | OPTI-XXX (nouveau boitier Felicity)"; exit 1 ;;
 esac

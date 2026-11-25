@@ -1,0 +1,113 @@
+#!/bin/sh
+# OPTI-MIST SOLUTIONS - Installation du LECTEUR UNIVERSEL (MPP / Voltronic, Felicity, SRNE ; lecture seule) - v1.0 du 25/11/2026
+# GO S.S. 25/11/2026 : un seul boitier universel pour tous les sites, mis a jour a distance.
+# Lancer en root depuis le dossier qui contient : mpp_collect.py, mpp_probe.py, felicity_collect.py
+#   (et, pour la mise a jour automatique : maj_auto.py + install_maj_auto.sh v1.3).
+#   sh install_universel.sh OPTI-046            nouveau boitier (envoi.conf cree, detection automatique des prises)
+#   sh install_universel.sh OPTI-111 1,2,3      nouveau boitier, Felicity en parallele sur un cable (adresses Modbus)
+#   sh install_universel.sh OPTI-111            boitier Felicity deja installe : passage au lecteur universel
+#                                               (envoi.conf, jeton et donnees gardes ; l'ancien releve Felicity est arrete)
+# url / direct_url / direct_jeton ne sont JAMAIS ecrits ici : S.S. les colle depuis le coffre dans /etc/opti061/envoi.conf.
+# Retour arriere : sh install_universel.sh --retour  (rallume le releve Felicity seul, arrete le lecteur universel).
+set -e
+[ "$(id -u)" = "0" ] || { echo "Lancer en root"; exit 1; }
+ICI="$(cd "$(dirname "$0")" && pwd)"
+CONF=/etc/opti061/envoi.conf
+
+if [ "$1" = "--retour" ]; then
+  systemctl disable --now opti-mpp.timer 2>/dev/null || true
+  [ -f /etc/systemd/system/opti061-felicity.timer ] || { echo "Pas de releve Felicity a rallumer"; exit 1; }
+  systemctl enable --now opti061-felicity.timer
+  [ -f /usr/local/bin/opti061.felicity ] && cp /usr/local/bin/opti061.felicity /usr/local/bin/opti061
+  echo "Retour fait : releve Felicity seul rallume."
+  exit 0
+fi
+
+CODE="$1"; ESCL="$2"
+case "$CODE" in OPTI-[0-9][0-9][0-9]) ;; *) echo "Usage : sh install_universel.sh OPTI-XXX [adresses Felicity ex. 1,2,3] | --retour"; exit 1 ;; esac
+case "$ESCL" in ""|*[!0-9,]*) [ -z "$ESCL" ] || { echo "Adresses invalides : $ESCL (ex. 1,2,3)"; exit 1; } ;; esac
+for f in mpp_collect.py mpp_probe.py felicity_collect.py; do [ -f "$ICI/$f" ] || { echo "$f manquant"; exit 1; }; done
+grep -q 'VERSION = "mpp 1\.[6-9]' "$ICI/mpp_collect.py" || { echo "mpp_collect.py v1.6 ou plus requis"; exit 1; }
+
+install -d -m 755 /opt/opti061 && install -d -m 750 /var/lib/opti061 /etc/opti061
+if [ -f "$CONF" ]; then
+  ANCIEN=$(sed -n 's/^code *= *//p' "$CONF" | head -1)
+  [ "$ANCIEN" = "$CODE" ] || { echo "envoi.conf est au code $ANCIEN, pas $CODE : arret (rien n'est change)"; exit 1; }
+  grep -q '^convertisseurs *=' "$CONF" || printf "convertisseurs = auto\n" >> "$CONF"
+  [ -z "$ESCL" ] || grep -q '^esclaves *=' "$CONF" || printf "esclaves = %s\n" "$ESCL" >> "$CONF"
+  echo "envoi.conf garde ($CODE) ; detection automatique des prises activee"
+else
+  cat > "$CONF" <<EOC
+# OPTI-MIST SOLUTIONS - envoi du boitier $CODE (lecteur universel, cree le $(date +%d/%m/%Y))
+code = $CODE
+convertisseurs = auto
+jours_conserves = 730
+rattrapage_jours = 90
+periode_min = 60
+alertes = non
+# A coller depuis le coffre par S.S. (jamais dans un message, un e-mail ou GitHub) :
+url =
+direct_url =
+direct_jeton =
+EOC
+  [ -z "$ESCL" ] || printf "esclaves = %s\n" "$ESCL" >> "$CONF"
+  chmod 600 "$CONF"
+  echo "envoi.conf cree pour $CODE (url et jeton a coller depuis le coffre)"
+fi
+
+for f in mpp_collect.py mpp_probe.py felicity_collect.py; do install -m 755 "$ICI/$f" /opt/opti061/$f; done
+
+# un seul lecteur sur les cables : l'ancien releve Felicity est arrete (garde pour le retour arriere)
+systemctl disable --now opti061-felicity.timer 2>/dev/null || true
+[ -f /usr/local/bin/opti061 ] && [ ! -f /usr/local/bin/opti061.felicity ] && cp /usr/local/bin/opti061 /usr/local/bin/opti061.felicity
+
+cat > /etc/systemd/system/opti-mpp.service <<EOF
+[Unit]
+Description=OPTI-MIST SOLUTIONS - releve universel $CODE
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/opti061/mpp_collect.py
+TimeoutStartSec=120
+EOF
+cat > /etc/systemd/system/opti-mpp.timer <<'EOF'
+[Unit]
+Description=OPTI-MIST SOLUTIONS - releve universel toutes les 5 minutes
+[Timer]
+OnBootSec=2min
+OnCalendar=*:0/5
+AccuracySec=10s
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+cat > /usr/local/bin/opti061 <<'EOF'
+#!/bin/sh
+case "$1" in
+  releve)   /usr/bin/python3 /opt/opti061/mpp_collect.py ;;
+  essai)    /usr/bin/python3 /opt/opti061/mpp_collect.py --sans-envoi ;;
+  detecter) /usr/bin/python3 /opt/opti061/mpp_collect.py --detecter ;;
+  dernier)  /usr/bin/python3 /opt/opti061/mpp_collect.py --show ;;
+  journal)  journalctl -u opti-mpp.service -n 30 --no-pager ;;
+  etat)     systemctl list-timers opti-mpp.timer --no-pager ;;
+  *) echo "Usage : opti061 releve | essai (sans envoi) | detecter | dernier | journal | etat" ;;
+esac
+EOF
+chmod 755 /usr/local/bin/opti061
+ln -sf /usr/local/bin/opti061 /usr/local/bin/opti
+H=$(hostname | tr -d '-'); case "$H" in opti[0-9][0-9][0-9]) ln -sf /usr/local/bin/opti061 /usr/local/bin/$H ;; esac   # commande de la banniere (ex. opti111)
+
+install -d /etc/opti087
+[ -f /etc/opti087/opti087.conf ] || printf "[site]\ncode_site = %s\n" "$CODE" > /etc/opti087/opti087.conf
+timedatectl set-timezone Africa/Ouagadougou 2>/dev/null || true
+systemctl daemon-reload
+systemctl enable --now opti-mpp.timer
+
+if [ -f "$ICI/install_maj_auto.sh" ] && [ -f "$ICI/maj_auto.py" ]; then
+  sh "$ICI/install_maj_auto.sh" "$CODE"
+else
+  echo "(maj_auto.py ou install_maj_auto.sh absent : mise a jour automatique non (re)installee)"
+fi
+echo "Lecteur universel installe pour $CODE. Prises vues :"
+opti061 detecter || true
+echo "Releve d'essai (sans envoi) :"
+opti061 essai || true
