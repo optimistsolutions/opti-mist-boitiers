@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OPTI-MIST SOLUTIONS - Pilote Felicity IVEM (RS232/RS485, Modbus RTU 9600 8N1) - v1.7 du 19/11/2026
+OPTI-MIST SOLUTIONS - Pilote Felicity IVEM (RS232/RS485, Modbus RTU 9600 8N1) - v1.8 du 27/11/2026
+v1.8 (27/11, GO S.S. 26/11 22h50, boitiers poses le 28/11 sans retour au banc ; audit du 26/11) : FONDATIONS.
+  - ECRITURES PROTEGEES : dernier.json, envoi_etat.json et tous les fichiers d'etat sont ecrits dans un fichier
+    temporaire, forces sur le disque (fsync), puis mis en place d'un coup (os.replace) : une coupure de courant
+    pendant l'ecriture laisse l'ancien fichier entier, jamais un fichier a moitie ecrit (constat de l'audit A).
+    Les lignes du stock (.jsonl) sont ajoutees avec fsync ; une ligne coupee par une coupure est isolee par un
+    saut de ligne avant la suivante (elle seule est perdue, la suivante est lue).
+  - HORLOGE SANS PILE (pas d'horloge sauvegardee sur la carte, S) : un releve fait avant la synchronisation de
+    l'heure par internet est marque heure_verifiee = 0 et range dans nv-<demarrage>.jsonl, avec le temps ecoule
+    depuis le demarrage (uptime_s). Des que l'heure est synchronisee, ces releves sont RECALES (heure reelle =
+    heure de synchronisation - temps ecoule entre le releve et la synchronisation, C) et copies dans le fichier
+    du bon jour, marques heure_verifiee = 2 (recalee) ; ils partent alors au rattrapage normal.
+  - PURGE SUR L'AGE REEL : rien n'est efface tant que l'heure n'est pas verifiee (une horloge fausse ne peut plus
+    effacer le stock).
 v1.7 (19/11, standard « zone isolee » GO S.S. 17/11, pour les NOUVEAUX boitiers) : dans envoi.conf, facultatif :
   jours_conserves = 730    (stock local en jours ; defaut 60, 7 a 1000)
   rattrapage_jours = 90    (profondeur du rattrapage apres coupure ; defaut 7, 1 a 90)
@@ -37,7 +50,7 @@ Les blocs bruts 0x1100-0x115F sont aussi enregistres, pour corriger la table san
 
 Usage : felicity_collect.py --once | --show     (port /dev/ttyUSB0, esclave 1)
 """
-import json, os, sys, termios, time, tty, select, urllib.request, datetime as dt
+import json, os, sys, termios, time, tty, select, subprocess, urllib.request, datetime as dt
 
 PORT, SLAVE, CODE = "/dev/ttyUSB0", 1, "OPTI-061"
 ESCLAVES = [1]
@@ -201,16 +214,145 @@ def releve():
     return rec
 
 
-def sauver(rec):
-    os.makedirs(DATA, exist_ok=True)
-    with open(os.path.join(DATA, rec["horodatage"][:10] + ".jsonl"), "a") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    with open(os.path.join(DATA, "dernier.json"), "w") as f:
-        json.dump(rec, f, ensure_ascii=False, indent=1)
+def ecrire_json(p, obj, indent=1):
+    """v1.8 : ecriture protegee (temporaire + fsync + remplacement d'un coup)."""
+    d = os.path.dirname(p) or "."
+    os.makedirs(d, exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=indent)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+    try:
+        fd = os.open(d, os.O_RDONLY)
+        os.fsync(fd)
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def lire_json(p, defaut=None):
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return defaut
+
+
+def ajouter_lignes(p, lignes):
+    """v1.8 : ajout au stock avec fsync ; une ligne coupee par une coupure est isolee par un saut de ligne."""
+    if not lignes:
+        return
+    os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+    with open(p, "a+b") as f:
+        if f.tell() > 0:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b"\n":
+                f.write(b"\n")
+        f.write("".join(l.rstrip("\n") + "\n" for l in lignes).encode("utf-8"))
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def boot_id():
+    try:
+        return open("/proc/sys/kernel/random/boot_id").read().strip()
+    except OSError:
+        return "inconnu"
+
+
+def uptime_s():
+    try:
+        return round(float(open("/proc/uptime").read().split()[0]), 1)
+    except (OSError, ValueError):
+        return None
+
+
+RUN = os.environ.get("OPTI_RUN", "/run/opti061")
+
+
+def horloge_ok():
+    """v1.8 : heure synchronisee par internet dans ce demarrage ? (marque en memoire vive une fois vue)."""
+    m = os.path.join(RUN, "horloge_ok")
+    if os.path.exists(m):
+        return True
+    ok = os.path.exists("/run/systemd/timesync/synchronized")
+    if not ok:
+        try:
+            r = subprocess.run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"], capture_output=True,
+                               text=True, timeout=5)
+            ok = r.stdout.strip() == "yes"
+        except (OSError, subprocess.SubprocessError):
+            ok = False
+    ok = ok and dt.date.today().year >= 2026
+    if ok:
+        try:
+            os.makedirs(RUN, exist_ok=True)
+            open(m, "w").write(dt.datetime.now().astimezone().isoformat(timespec="seconds") + " %s\n" % uptime_s())
+        except OSError:
+            pass
+    return ok
+
+
+def fichier_stock(rec, prefixe=""):
+    """v1.8 : fichier du jour si l'heure est verifiee, sinon nv-<demarrage>.jsonl (a recaler)."""
+    if rec.get("heure_verifiee") == 0:
+        return os.path.join(DATA, "%snv-%s.jsonl" % (prefixe, (rec.get("boot") or "inconnu")[:8]))
+    return os.path.join(DATA, prefixe + rec["horodatage"][:10] + ".jsonl")
+
+
+def recaler():
+    """v1.8 : heure synchronisee -> les releves de CE demarrage faits avant la synchronisation sont recales."""
+    if not horloge_ok():
+        return 0
+    b = boot_id()[:8]
+    maint, up = dt.datetime.now().astimezone(), uptime_s()
+    if up is None:
+        return 0
+    n = 0
+    for prefixe in ("", "min-"):
+        p = os.path.join(DATA, "%snv-%s.jsonl" % (prefixe, b))
+        if not os.path.exists(p):
+            continue
+        par_jour = {}
+        for l in open(p, encoding="utf-8"):
+            try:
+                r = json.loads(l)
+                u = float(r["uptime_s"])
+            except Exception:
+                continue
+            reel = maint - dt.timedelta(seconds=max(0.0, up - u))
+            r["horodatage_brut"] = r.get("horodatage")
+            r["horodatage"] = reel.isoformat(timespec="seconds")
+            r["heure_verifiee"] = 2                         # recalee (C)
+            par_jour.setdefault(os.path.join(DATA, prefixe + r["horodatage"][:10] + ".jsonl"), []).append(
+                json.dumps(r, ensure_ascii=False))
+            n += 1
+        for f, lignes in par_jour.items():
+            ajouter_lignes(f, lignes)
+        os.replace(p, p + ".recale")
+    return n
+
+
+def purger():
+    """v1.8 : purge sur l'age reel, seulement quand l'heure est verifiee."""
+    if not horloge_ok():
+        return
     limite = (dt.date.today() - dt.timedelta(days=JOURS)).isoformat()
     for n in os.listdir(DATA):
-        if n.endswith(".jsonl") and n[:10] < limite:
-            os.remove(os.path.join(DATA, n))
+        p = os.path.join(DATA, n)
+        if n.endswith(".jsonl") and n[-16:-6] < limite and n[-16:-6][:2] == "20":
+            os.remove(p)
+        elif (".jsonl" in n and "nv-" in n) and time.time() - os.path.getmtime(p) > JOURS * 86400:
+            os.remove(p)
+
+
+def sauver(rec):
+    os.makedirs(DATA, exist_ok=True)
+    ajouter_lignes(fichier_stock(rec), [json.dumps(rec, ensure_ascii=False)])      # v1.8
+    ecrire_json(os.path.join(DATA, "dernier.json"), rec)                            # v1.8 : protege
+    purger()
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +437,8 @@ def releves_par_heure(depuis):
     """{AAAA-MM-JJTHH: dernier releve de l'heure} lu dans le stock local, a partir de l'heure 'depuis' (exclue)."""
     out = {}
     for n in sorted(os.listdir(DATA)):
-        if not n.endswith(".jsonl") or n[:10] < depuis[:10]:
-            continue
+        if not n.endswith(".jsonl") or len(n) != 16 or n[:2] != "20" or n[:10] < depuis[:10]:
+            continue                # v1.8 : fichiers du jour seulement (ni minutes, ni releves a recaler)
         for l in open(os.path.join(DATA, n), encoding="utf-8"):
             try:
                 r = json.loads(l)
@@ -324,6 +466,8 @@ def envoyer(rec):
     cfg = lire_envoi()
     if not cfg["url"]:
         return "envoi=non_configure"
+    if not horloge_ok():
+        return "envoi=attente_heure"      # v1.8 : pas d'historique horaire sur une horloge non verifiee
     maint = dt.datetime.now()
     derniere = lire_etat_envoi()
     plancher = heure(maint - dt.timedelta(hours=RATTRAPAGE_H))
@@ -347,8 +491,8 @@ def envoyer(rec):
         if res.get("status") != "ok":
             return "envoi=refuse %d/%d" % (envoyees, len(a_envoyer))
         envoyees += len(lot)
-        with open(os.path.join(DATA, "envoi_etat.json"), "w") as f:
-            json.dump({"derniere_heure": lot[-1][0], "maj": maint.isoformat(timespec="seconds")}, f)
+        ecrire_json(os.path.join(DATA, "envoi_etat.json"), {"derniere_heure": lot[-1][0],
+                    "maj": maint.isoformat(timespec="seconds")}, None)            # v1.8 : protege
     return "envoi=ok %d ligne(s)%s" % (envoyees, " dont %d de rattrapage" % (envoyees - 1) if envoyees > 1 else "")
 
 
@@ -372,6 +516,9 @@ def etat_secours():
             "secours_mo_jour": mo(maint.strftime("%Y-%m-%d")), "secours_mo_mois": mo(maint.strftime("%Y-%m"))}
 
 
+REPONSE_DIRECT = {}      # v1.8 : derniere reponse du tableau de bord (accuse de reception des evenements)
+
+
 def envoyer_direct(rec):
     """v1.4 : dernier releve -> carte "Boitiers en direct" du tableau de bord (valeurs lues telles quelles)."""
     cfg = lire_envoi()
@@ -387,12 +534,19 @@ def envoyer_direct(rec):
                                            "charge_puissance_w", "charge_apparente_va", "charge_pct", "reseau_tension_v",
                                            "reseau_frequence_hz", "sortie_tension_v", "pv_w",
                                            "convertisseurs_lus", "convertisseurs_attendus") if k in v}, **etat_secours())}}
+    for k in ("sante", "evenements", "energie_jour", "heure_verifiee", "absents", "alerte"):   # v1.8 : donnees brutes
+        x = rec.get(k, v.get(k))
+        if x not in (None, "", []):
+            corps["direct"][k] = x
+    global REPONSE_DIRECT
+    REPONSE_DIRECT = {}
     try:
         req = urllib.request.Request(cfg["direct_url"], data=json.dumps(corps).encode(),
                                      headers={"Content-Type": "application/json"})
         res = json.loads(urllib.request.urlopen(req, timeout=20).read().decode("utf-8"))
     except Exception as e:
         return "direct=echec(%s)" % type(e).__name__
+    REPONSE_DIRECT = res if isinstance(res, dict) else {}
     return "direct=ok" if res.get("status") == "ok" else "direct=refuse"
 
 
