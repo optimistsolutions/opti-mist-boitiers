@@ -22,6 +22,13 @@ v1.7 (27/11, GO S.S. 26/11 22h50 ; boitiers poses le 28/11 et ne revenant plus a
     (registre 0x0102 sans sens sur le HYP, M 26/11) ; registres bruts gardes dans le releve complet.
   - Ecritures protegees, heure non verifiee puis recalee, purge sur l'age reel : voir felicity_collect v1.8.
   Commandes : --test (sans cable), --complet, --evenements, --sante. Rejeu : rejeu/rejeu_cycle17.py.
+v1.7a (27/11 00h, veille forums Solar Assistant / Armbian / Victron, GO S.S. 26/11) : AUTO-GUERISON. Sur les Voltronic, le
+  port USB se reinitialise parfois et la carte finit par l'abandonner : plus de lecture jusqu'a un redemarrage manuel
+  (forums, S). Convertisseur deja lu dans ce demarrage puis muet 5 min -> le boitier debranche et rebranche SA prise USB
+  par logiciel (evenement usb_reinitialise, une fois par 30 min et par convertisseur). Tous muets 30 min -> redemarrage
+  du boitier (evenement redemarrage_auto), au plus une fois toutes les 6 h. Rien n'est envoye au convertisseur.
+  Nouvelle detection sur convertisseur muet : au plus une fois toutes les 10 min (elle dure 40 a 90 s ; chaque minute,
+  elle aurait empeche la mesure des autres convertisseurs, C).
 v1.6b (26/11 21h, banc, SRNE HYP4860S100-H 6,2 kVA) : ADRESSE MODBUS DU SRNE. Ce SRNE etait regle sur l'adresse 2
   (ecran « Id: 2 », M) ; la detection ne l'essayait qu'a l'adresse 1 -> non reconnu (M 20h56). Desormais, a la
   detection, adresses 1 a 9 essayees une par une (Felicity 0x1100 puis SRNE 0x0100, lecture seule fonction 03) ;
@@ -121,7 +128,7 @@ sys.path.insert(0, ICI)
 import felicity_collect as fc      # stockage, rattrapage, envoi (v1.7)
 import mpp_probe as mp             # trame, CRC, liaison serie / USB (v1.1)
 
-VERSION = "mpp 1.7"
+VERSION = "mpp 1.7a"
 SRNE = [("batterie_soc_pct", 0x0100, False, 1), ("batterie_tension_v", 0x0101, False, 10),
         ("batterie_courant_a", 0x0102, True, 10), ("pv1_tension_v", 0x0107, False, 10),
         ("pv1_courant_a", 0x0108, False, 10), ("pv1_puissance_w", 0x0109, False, 1),
@@ -532,7 +539,17 @@ def releve_plusieurs(rec, deja=False):
         else:
             par[nom] = {"statut": r["statut"]}
     ok = [c[0] for c in CONVERTISSEURS if statuts[c[0]] == "OK"]
-    if AUTO and not deja and any(statuts[c[0]] != "OK" and os.path.exists(c[1]) for c in CONVERTISSEURS):
+    marque_det = os.path.join(fc.RUN, "detection_muet")   # v1.7a : au plus une detection toutes les 10 min
+    try:
+        recent = time.time() - os.path.getmtime(marque_det) < 600
+    except OSError:
+        recent = False
+    if AUTO and not deja and not recent and any(statuts[c[0]] != "OK" and os.path.exists(c[1]) for c in CONVERTISSEURS):
+        try:
+            os.makedirs(fc.RUN, exist_ok=True)
+            open(marque_det, "w").close()
+        except OSError:
+            pass
         avant = list(CONVERTISSEURS)              # v1.5 : un muet sur une prise presente -> nouvelle detection
         CONVERTISSEURS = detecter(forcer=True)
         if CONVERTISSEURS != avant:
@@ -657,7 +674,8 @@ for _q in MPP_MEMOIRE:
 SRNE_MEMOIRE = ((0xF800, 32), (0xF820, 32), (0xF840, 32), (0xF860, 32), (0xE000, 32), (0xE020, 32))
 TYPES_EVENEMENTS = ("demarrage_boitier", "heure_synchronisee", "coupure_reseau", "retour_reseau", "changement_mode",
                     "avertissement", "convertisseur_absent", "convertisseur_retour", "detection_refaite",
-                    "journal_defauts", "reglages_modifies", "temperature_boitier", "disque_presque_plein")
+                    "journal_defauts", "reglages_modifies", "temperature_boitier", "disque_presque_plein",
+                    "usb_reinitialise", "redemarrage_auto")                                     # v1.7a
 
 
 def p_data(n):
@@ -952,6 +970,80 @@ def journal_srne(brut):
     return out
 
 
+# v1.7a (27/11, veille forums : port USB des Voltronic qui se reinitialise et que la carte abandonne ; chien de garde
+# H6 non fiable sur certaines cartes) : AUTO-GUERISON. Aucune commande n'est envoyee au convertisseur.
+MUET_RESET_MIN, MUET_REDEMARRAGE_MIN, REDEMARRAGE_ECART_H = 5, 30, 6
+
+
+def usb_parent(port):
+    """Dossier sysfs du peripherique USB derriere une prise serie (/dev/ttyUSBx, ttyACMx, hidrawx, by-path)."""
+    try:
+        reel = os.path.basename(os.path.realpath(port))
+    except OSError:
+        return None
+    for classe in ("tty", "hidraw"):
+        d = "/sys/class/%s/%s/device" % (classe, reel)
+        if os.path.exists(d):
+            d = os.path.realpath(d)
+            while d and d != "/" and not (os.path.exists(os.path.join(d, "authorized"))
+                                          and os.path.exists(os.path.join(d, "idVendor"))):
+                d = os.path.dirname(d)
+            return d if d and d != "/" else None
+    return None
+
+
+def reinitialiser_usb(port):
+    """Debranche puis rebranche la prise USB par logiciel (cote boitier, sysfs authorized 0 -> 1)."""
+    d = usb_parent(port)
+    if not d:
+        return "prise USB introuvable"
+    try:
+        with open(os.path.join(d, "authorized"), "w") as f:
+            f.write("0")
+        time.sleep(2)
+        with open(os.path.join(d, "authorized"), "w") as f:
+            f.write("1")
+        time.sleep(3)
+        return "ok"
+    except OSError as e:
+        return "echec %s" % e.__class__.__name__
+
+
+def guerir(rec, etat):
+    """Convertisseur muet 5 min (lu auparavant dans ce demarrage) -> reinitialisation de sa prise USB (1 fois / 30 min).
+    Tous muets 30 min -> redemarrage du boitier, au plus une fois toutes les 6 h (DATA/redemarrage_auto.json)."""
+    evs = []
+    if not CONVERTISSEURS:
+        return evs
+    m = etat.setdefault("muet", {})
+    vus = etat.setdefault("vus_ok", [])
+    pc = rec.get("par_convertisseur") or {}
+    up = rec.get("uptime_s") or 0
+    for nom, port, marque in CONVERTISSEURS:
+        v = pc.get(nom) or {"statut": "absent"}
+        if not v.get("statut"):
+            m[nom] = 0
+            if nom not in vus:
+                vus.append(nom)
+            continue
+        if nom not in vus:
+            continue
+        m[nom] = m.get(nom, 0) + 1
+        dr = etat.setdefault("usb_reset_up", {})
+        if m[nom] >= MUET_RESET_MIN and os.path.exists(port) and up - dr.get(nom, -1e9) >= 1800:
+            dr[nom] = up
+            evs.append({"type": "usb_reinitialise", "conv": nom, "muet_min": m[nom], "resultat": reinitialiser_usb(port)})
+    tous = [n for n, _, _ in CONVERTISSEURS if n in vus]
+    if tous and all(m.get(n, 0) >= MUET_REDEMARRAGE_MIN for n in tous):
+        p = p_data("redemarrage_auto.json")
+        dern = (fc.lire_json(p, {}) or {}).get("t", 0)
+        if time.time() - dern >= REDEMARRAGE_ECART_H * 3600 or time.time() < dern:
+            fc.ecrire_json(p, {"t": time.time(), "horodatage": rec["horodatage"]})
+            evs.append({"type": "redemarrage_auto", "muet_min": min(m.get(n, 0) for n in tous)})
+            etat["redemarrer"] = 1
+    return evs
+
+
 def ligne_minute(rec):
     v = rec.get("valeurs") or {}
     x = {"t": rec["horodatage"], "hv": rec.get("heure_verifiee"), "up": rec.get("uptime_s"), "boot": rec.get("boot"),
@@ -1014,6 +1106,7 @@ def cycle(t0, force=False, envoyer=True):
     rec["heure_verifiee"] = 1 if fc.horloge_ok() else 0
     rec["boot"], rec["uptime_s"] = etat["boot"], fc.uptime_s()
     evs = detecter_evenements(rec, etat, premier)
+    evs += guerir(rec, etat)                              # v1.7a
     integrer(rec, etat)
     etat["m_up"] = up
     complet = force or premier or etat.get("c_up") is None or up - etat["c_up"] >= COMPLET_S - 20
@@ -1050,6 +1143,11 @@ def cycle(t0, force=False, envoyer=True):
             # campagne au banc (fichier DATA/BANC) : pas d'historique horaire sous le code du site client
             rec["envoi"] = "envoi=banc" if os.path.exists(p_data("BANC")) else fc.envoyer(rec)
         rec.pop("evenements", None)
+    if etat.pop("redemarrer", None):                      # v1.7a : dernier recours, tout est deja ecrit
+        vider_minutes()
+        fc.ecrire_json(ETAT_RAM, etat)
+        if not os.environ.get("OPTI_SANS_REDEMARRAGE"):
+            os.system("sync; systemctl reboot")
     fc.ecrire_json(ETAT_RAM, etat)
     rec["complet"] = 1 if complet else 0
     return rec
