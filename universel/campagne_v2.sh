@@ -1,5 +1,5 @@
 #!/bin/sh
-# OPTI-MIST SOLUTIONS - campagne de validation au banc du lecteur universel v1.7 - v2.0 du 27/11/2026
+# OPTI-MIST SOLUTIONS - campagne de validation au banc du lecteur universel v1.7 - v2.1 du 27/11/2026 (v2.1 : commande redemarrage, scenario 8b)
 # GO S.S. 26/11 22h50 : tout est valide au banc avant la pose du 28/11 (un boitier pose ne revient plus au banc).
 # Lecture seule des convertisseurs. Un seul script par boitier, 4 commandes :
 #   sh /root/campagne_v2.sh prepare   installe la v1.7 depuis /root (install_universel v1.1), controle l'installation,
@@ -8,6 +8,7 @@
 #   sh /root/campagne_v2.sh suivi     affiche chaque minute la mesure et les nouveaux evenements (Ctrl+C pour sortir ;
 #                                     la mesure continue). A relancer apres chaque redemarrage du boitier.
 #   sh /root/campagne_v2.sh blocage   scenario 8 : plantage volontaire du noyau, chien de garde seul -> redemarrage
+#   sh /root/campagne_v2.sh redemarrage  scenario 8b : redemarrage normal (certaines cartes H6 restent bloquees, forums)
 #   sh /root/campagne_v2.sh bilan     controle automatique (VERT / ROUGE) -> /root/bilan_<boitier>_<date>.txt
 #   sh /root/campagne_v2.sh fin       efface les donnees d'essai et le marquage BANC (a faire avant la pose)
 set -u
@@ -79,6 +80,12 @@ blocage)
   echo 1 > /proc/sys/kernel/sysrq
   sleep 2
   echo c > /proc/sysrq-trigger
+  ;;
+redemarrage)
+  echo "=== $H - scenario 8b : redemarrage normal a $(date +%T). Le boitier doit revenir en moins de 3 min."
+  date -Iseconds > $D/REDEMARRAGE_DEMANDE
+  sync
+  systemctl reboot
   ;;
 bilan)
   F=/root/bilan_${H}_$(date +%Y%m%d_%H%M).txt
@@ -162,7 +169,7 @@ for m in mins:
     for n in (m.get("pc") or {}):
         noms[n].add(1)
 print("   noms des convertisseurs vus : %s (scenario 5 : noms inchanges apres echange des cables)" % ", ".join(sorted(noms)))
-ctl(t["demarrage_boitier"] >= 6, "scenarios 7-8 : demarrages du boitier dates (%d, objectif 6 = 5 coupures + blocage)" % t["demarrage_boitier"])
+ctl(t["demarrage_boitier"] >= 7, "scenarios 7-8b : demarrages du boitier dates (%d, objectif 7 = 5 coupures + blocage + redemarrage)" % t["demarrage_boitier"])
 ctl(any(e.get("pendant_arret") for e in ev), "changement survenu boitier eteint signale (pendant_arret)")
 ctl(any(c.get("heure_verifiee") == 2 for c in comp) or t["heure_synchronisee"] >= 1, "scenario 6 : heure non verifiee puis recalee")
 srne = [c for c in comp for n, v in (c.get("par_convertisseur") or {}).items() if v.get("courant_sens") == "deduit"]
@@ -191,5 +198,5 @@ fin)
   systemctl start opti-mpp.timer
   echo "=== $H - donnees d'essai effacees, marquage BANC retire : pret pour la pose ($(date '+%d/%m %T'))"
   ;;
-*) echo "Usage : sh campagne_v2.sh prepare | suivi | blocage | bilan | fin" ;;
+*) echo "Usage : sh campagne_v2.sh prepare | suivi | blocage | redemarrage | bilan | fin" ;;
 esac
