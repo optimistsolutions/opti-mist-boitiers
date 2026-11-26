@@ -1,5 +1,6 @@
 #!/bin/sh
-# OPTI-MIST SOLUTIONS - Installation de la mise a jour automatique (v1.3, 25/11/2026 : boitier universel -> composant
+# OPTI-MIST SOLUTIONS - Installation de la mise a jour automatique (v1.4, 27/11/2026 : boitier universel -> composant
+#   mpp_probe.py ajoute, tests par mpp_collect.py --test (lecteur et module commun), GO S.S. 26/11 ; v1.3, 25/11/2026 : boitier universel -> composant
 #   mpp_collect.py ajoute si le lecteur universel est installe (/opt/opti061/mpp_collect.py), GO S.S. 25/11 ; v1.2, 24/11/2026 : tout nouveau boitier Felicity OPTI-XXX,
 #   composants felicity_collect.py + wifi_config.py, GO S.S. 24/11 « on fait tout aujourd'hui » ; v1.1, 22/11/2026 : 7h30 ET 13h ; v1.0, 15/11/2026)
 # A lancer en root depuis le dossier qui contient maj_auto.py :  sh install_maj_auto.sh OPTI-087   (ou OPTI-061)
@@ -51,7 +52,7 @@ section_envoi =
 [composant:felicity_collect.py]
 source = felicity/felicity_collect.py
 chemin = /opt/opti061/felicity_collect.py
-test = /usr/bin/python3 /opt/opti061/felicity_collect.py --show >/dev/null
+test = /usr/bin/python3 -m py_compile /opt/opti061/felicity_collect.py && { [ ! -f /opt/opti061/mpp_collect.py ] || /usr/bin/python3 /opt/opti061/mpp_collect.py --test >/dev/null; }
 
 [composant:wifi_config.py]
 source = reseau/wifi_config.py
@@ -63,7 +64,12 @@ EOC
 [composant:mpp_collect.py]
 source = mpp/mpp_collect.py
 chemin = /opt/opti061/mpp_collect.py
-test = /usr/bin/python3 -m py_compile /opt/opti061/mpp_collect.py
+test = /usr/bin/python3 /opt/opti061/mpp_collect.py --test >/dev/null
+
+[composant:mpp_probe.py]
+source = mpp/mpp_probe.py
+chemin = /opt/opti061/mpp_probe.py
+test = /usr/bin/python3 /opt/opti061/mpp_collect.py --test >/dev/null
 EOC
   fi
   ;;

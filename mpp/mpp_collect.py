@@ -1,7 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OPTI-MIST SOLUTIONS - Lecteur universel : MPP / Voltronic (PI30), SRNE et Felicity (Modbus) - v1.6b du 26/11/2026
+OPTI-MIST SOLUTIONS - Lecteur universel : MPP / Voltronic (PI30), SRNE et Felicity (Modbus) - v1.7 du 27/11/2026
+v1.7 (27/11, GO S.S. 26/11 22h50 ; boitiers poses le 28/11 et ne revenant plus au banc ; audit du 26/11) : le boitier
+  capte et garde TOUT en brut ; l'interpretation (codes, alertes, rapports) se fait cote serveur et peut evoluer sans
+  toucher aux boitiers poses. Toujours LECTURE SEULE (QPIGS..., QPIRI, QFLAG, QVFW, QBEQI ; Modbus fonction 03).
+  - MESURE CHAQUE MINUTE (minuteur systemd), releve complet toutes les 5 min ; cadence reglable a distance dans
+    envoi.conf (mesure_s, complet_min) ; lignes minute en memoire vive, ecrites sur le disque toutes les 5 min.
+  - EVENEMENTS DATES (DATA/evenements.jsonl, numerotes) : demarrage du boitier, heure synchronisee, coupure et
+    retour du reseau, changement de mode, avertissement (QPIWS brut), convertisseur absent / de retour, detection
+    refaite, nouvelle fiche au journal des defauts, reglage modifie, temperature du boitier, disque presque plein.
+    Un changement survenu boitier eteint est marque pendant_arret. Envoyes avec le direct, les plus anciens non
+    accuses d'abord (20 au plus) : aucun ne se perd quand le tableau de bord accusera reception (evenements_recus).
+  - ENERGIE CALCULEE minute par minute (C) : solaire, consommation, charge et decharge batterie, par jour
+    (DATA/energie.json, 730 jours) ; le MPP n'a pas d'historique d'energie (QET/QEY/QEM/QED = NAK, M 26/11).
+  - SANTE : temperature du processeur, disque et memoire libres, charge, temps depuis le demarrage, nombre de
+    demarrages (DATA/demarrages.json), chien de garde, duree de la mesure.
+  - MEMOIRE DES CONVERTISSEURS une fois par jour : journal des defauts SRNE 0xF800-0xF87F (8 fiches, M 26/11) et
+    bloc 0xE000-0xE03F, reponses QPIRI / QFLAG / QVFW / QBEQI du MPP, gardes bruts dans DATA/memoire/.
+  - SRNE : sens du courant deduit sur batterie sans reseau quand le solaire ne couvre pas la consommation
+    (registre 0x0102 sans sens sur le HYP, M 26/11) ; registres bruts gardes dans le releve complet.
+  - Ecritures protegees, heure non verifiee puis recalee, purge sur l'age reel : voir felicity_collect v1.8.
+  Commandes : --test (sans cable), --complet, --evenements, --sante. Rejeu : rejeu/rejeu_cycle17.py.
 v1.6b (26/11 21h, banc, SRNE HYP4860S100-H 6,2 kVA) : ADRESSE MODBUS DU SRNE. Ce SRNE etait regle sur l'adresse 2
   (ecran « Id: 2 », M) ; la detection ne l'essayait qu'a l'adresse 1 -> non reconnu (M 20h56). Desormais, a la
   detection, adresses 1 a 9 essayees une par une (Felicity 0x1100 puis SRNE 0x0100, lecture seule fonction 03) ;
@@ -101,7 +121,7 @@ sys.path.insert(0, ICI)
 import felicity_collect as fc      # stockage, rattrapage, envoi (v1.7)
 import mpp_probe as mp             # trame, CRC, liaison serie / USB (v1.1)
 
-VERSION = "mpp 1.6b"
+VERSION = "mpp 1.7"
 SRNE = [("batterie_soc_pct", 0x0100, False, 1), ("batterie_tension_v", 0x0101, False, 10),
         ("batterie_courant_a", 0x0102, True, 10), ("pv1_tension_v", 0x0107, False, 10),
         ("pv1_courant_a", 0x0108, False, 10), ("pv1_puissance_w", 0x0109, False, 1),
@@ -253,7 +273,7 @@ def absents_7j(lus):
         vus[n] = maintenant
     vus = {n: t for n, t in vus.items() if maintenant - t < 7 * 86400}
     try:
-        json.dump(vus, open(p, "w"), indent=1)
+        fc.ecrire_json(p, vus)                    # v1.7 : ecriture protegee
     except OSError:
         pass
     return sorted(n for n in vus if n not in lus)
@@ -327,9 +347,9 @@ def detecter(forcer=False):
             unites[port] = [ADR_SRNE.get(port, 1)]          # v1.6b : adresse gardee pour la lecture
     conv.sort(key=lambda c: c[0])
     os.makedirs(fc.DATA, exist_ok=True)
-    json.dump(ids, open(os.path.join(fc.DATA, "identites.json"), "w"), indent=1)
-    json.dump({"horodatage": dt.datetime.now().astimezone().isoformat(timespec="seconds"), "prises": liste,
-               "convertisseurs": conv, "cles": cles, "unites": unites}, open(p, "w"), indent=1)
+    fc.ecrire_json(os.path.join(fc.DATA, "identites.json"), ids)            # v1.7 : ecritures protegees
+    fc.ecrire_json(p, {"horodatage": dt.datetime.now().astimezone().isoformat(timespec="seconds"), "prises": liste,
+                       "convertisseurs": conv, "cles": cles, "unites": unites})
     CLES, UNITES_PRISE = cles, unites
     return conv
 
@@ -419,8 +439,6 @@ def srne_valeurs(blocs):
     if etat is not None:                                          # v1.5a / v1.6 : etat de marche (S)
         val["etat_srne"] = etat
         val["mode_brut"] = {3: "B", 4: "L", 5: "B"}.get(etat, "E%d" % etat)
-    if val.get("batterie_tension_v") is not None and val.get("batterie_courant_a") is not None:
-        val["batterie_puissance_w"] = round(val["batterie_tension_v"] * val["batterie_courant_a"])   # C
     pv1 = val.get("pv1_puissance_w") or 0
     tri = {}
     for nom, a, signe, div in SRNE_TRI:
@@ -429,6 +447,17 @@ def srne_valeurs(blocs):
             tri[nom] = round(x / div, 2) if div != 1 else x
     pvt = tri.pop("pv_total_w", None)
     val["pv_w"] = pvt if pvt is not None and pvt >= pv1 else pv1
+    # v1.7 : SENS DU COURANT. Sur le HYP le registre 0x0102 ne donne pas toujours le sens (M 26/11). Regle physique :
+    # sur batterie (mode B), sans reseau, avec moins de solaire que de consommation, la batterie ne peut pas charger
+    # -> courant compte en decharge (C). La valeur lue reste dans batterie_courant_lu_a.
+    c = val.get("batterie_courant_a")
+    if c is not None and c > 0 and val.get("mode_brut") == "B" and (val.get("reseau_tension_v") or 0) < 150 \
+            and (val.get("pv_w") or 0) < (val.get("charge_puissance_w") or 0) + 50:
+        val["batterie_courant_lu_a"] = c
+        val["batterie_courant_a"] = -c
+        val["courant_sens"] = "deduit"
+    if val.get("batterie_tension_v") is not None and val.get("batterie_courant_a") is not None:
+        val["batterie_puissance_w"] = round(val["batterie_tension_v"] * val["batterie_courant_a"])   # C
     for k in ("pv2_tension_v", "pv_jour_kwh"):          # v1.6b : phase_max_w seulement en triphase
         if k in tri:
             val[k] = tri.pop(k)
@@ -470,7 +499,7 @@ def lire_srne(port):
     val = srne_valeurs(blocs)
     if val is None:
         return {"statut": "CONVERTISSEUR_MUET"}
-    return {"statut": "OK", "valeurs": val}
+    return {"statut": "OK", "valeurs": val, "brut": {"%04X" % a: r for a, r in blocs.items()}}    # v1.7 : brut garde
 
 
 def releve_plusieurs(rec, deja=False):
@@ -484,7 +513,7 @@ def releve_plusieurs(rec, deja=False):
                     CONVERTISSEURS = detecter(forcer=True)
                     rec["detection"] = "refaite (cables echanges)"
                     break
-    par, statuts = {}, {}
+    par, statuts, bruts = {}, {}, {}
     for nom, port, marque in CONVERTISSEURS:
         if not os.path.exists(port):
             r = {"statut": "PORT_INDISPONIBLE"}
@@ -496,6 +525,8 @@ def releve_plusieurs(rec, deja=False):
         else:
             r = lire_port(port, {}, 1)
         statuts[nom] = r["statut"]
+        if r.get("brut"):
+            bruts[nom] = r["brut"]                # v1.7 : registres / reponses brutes gardes (releve complet)
         if r["statut"] == "OK":
             par[nom] = r["valeurs"]
         else:
@@ -509,6 +540,8 @@ def releve_plusieurs(rec, deja=False):
             return releve_plusieurs(rec, deja=True)
     rec["par_convertisseur"] = par
     rec["statuts"] = statuts
+    if bruts:
+        rec["brut_par_convertisseur"] = bruts
     if not ok:
         rec["statut"] = "CONVERTISSEUR_MUET" if any(s == "CONVERTISSEUR_MUET" for s in statuts.values()) else "PORT_INDISPONIBLE"
         return rec
@@ -604,10 +637,428 @@ def lire_port(port, rec, unites):
     return rec
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# v1.7 (27/11) : MESURE CHAQUE MINUTE, EVENEMENTS DATES, ENERGIE CALCULEE, SANTE, MEMOIRE DES CONVERTISSEURS
+# Le minuteur lance ce fichier chaque minute ; la cadence reelle se regle dans envoi.conf (sans toucher au boitier) :
+#   mesure_s = 60        (secondes entre deux mesures ; 60 a 900)
+#   complet_min = 5      (minutes entre deux releves complets : disque, direct, rattrapage horaire ; 5 a 60)
+# Chaque minute : mesure, evenements, energie, ligne courte en memoire vive (/run, pas d'usure du disque).
+# Tous les 5 min : lignes de la periode ecrites sur le disque d'un coup, releve complet (avec les reponses brutes),
+#   sante du boitier, envoi direct (avec les evenements non encore accuses), historique horaire.
+# Une fois par jour : lecture seule de la memoire des convertisseurs (journal des defauts et reglages SRNE,
+#   reglages et drapeaux MPP), gardee brute ; un changement produit un evenement.
+# ---------------------------------------------------------------------------------------------------------------
+MESURE_S, COMPLET_S = 60, 300
+ETAT_RAM = os.path.join(fc.RUN, "etat.json")
+MINUTES_RAM = os.path.join(fc.RUN, "minutes.jsonl")
+MPP_MEMOIRE = ("QPIRI", "QFLAG", "QVFW", "QBEQI")
+for _q in MPP_MEMOIRE:
+    assert _q.startswith("Q"), _q                # interrogation seulement
+SRNE_MEMOIRE = ((0xF800, 32), (0xF820, 32), (0xF840, 32), (0xF860, 32), (0xE000, 32), (0xE020, 32))
+TYPES_EVENEMENTS = ("demarrage_boitier", "heure_synchronisee", "coupure_reseau", "retour_reseau", "changement_mode",
+                    "avertissement", "convertisseur_absent", "convertisseur_retour", "detection_refaite",
+                    "journal_defauts", "reglages_modifies", "temperature_boitier", "disque_presque_plein")
+
+
+def p_data(n):
+    return os.path.join(fc.DATA, n)
+
+
+def regler_cadence():
+    global MESURE_S, COMPLET_S
+    cfg = fc.lire_envoi_brut()
+    try:
+        MESURE_S = min(900, max(60, int(cfg.get("mesure_s") or 60)))
+    except ValueError:
+        MESURE_S = 60
+    try:
+        COMPLET_S = 60 * min(60, max(5, int(cfg.get("complet_min") or 5)))
+    except ValueError:
+        COMPLET_S = 300
+
+
+def cpu_c():
+    t = []
+    for f in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
+        try:
+            t.append(int(open(f).read().strip()) / 1000.0)
+        except (OSError, ValueError):
+            pass
+    return round(max(t), 1) if t else None
+
+
+def sante(t0):
+    s = {"version": VERSION, "boot": fc.boot_id()[:8], "uptime_s": fc.uptime_s(), "cpu_c": cpu_c(),
+         "duree_mesure_s": round(time.time() - t0, 1)}
+    try:
+        st = os.statvfs(fc.DATA)
+        s["disque_libre_mo"] = round(st.f_bavail * st.f_frsize / 1048576)
+        s["disque_libre_pct"] = round(100.0 * st.f_bavail / st.f_blocks, 1)
+    except OSError:
+        pass
+    try:
+        for l in open("/proc/meminfo"):
+            if l.startswith("MemAvailable:"):
+                s["ram_libre_mo"] = round(int(l.split()[1]) / 1024)
+        s["charge_1m"] = round(os.getloadavg()[0], 2)
+    except (OSError, ValueError):
+        pass
+    d = fc.lire_json(p_data("demarrages.json"), []) or []
+    s["demarrages_total"] = len(d)
+    s["banc"] = 1 if os.path.exists(p_data("BANC")) else 0
+    s["chien_de_garde"] = 1 if os.path.exists("/etc/systemd/system.conf.d/opti-watchdog.conf") and \
+        os.path.exists("/dev/watchdog") else 0
+    return {k: v for k, v in s.items() if v is not None}
+
+
+def evenement_seq():
+    """Plus grand numero d'evenement deja ecrit (fin du fichier : un arret brutal ne cree pas de doublon)."""
+    p = p_data("evenements.jsonl")
+    try:
+        with open(p, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 65536))
+            lignes = f.read().decode("utf-8", "ignore").splitlines()
+    except OSError:
+        return 0
+    m = 0
+    for l in lignes:
+        try:
+            m = max(m, int(json.loads(l)["id"]))
+        except Exception:
+            pass
+    return m
+
+
+def ecrire_evenements(evs, rec, etat):
+    """Evenements ecrits tout de suite sur le disque (rares, importants)."""
+    if not evs:
+        return []
+    seq = etat.get("seq") or evenement_seq()
+    out = []
+    for e in evs:
+        seq += 1
+        x = {"id": seq, "t": rec["horodatage"], "hv": rec.get("heure_verifiee", 1), "boot": rec.get("boot"),
+             "up": rec.get("uptime_s"), "site": fc.CODE}
+        x.update(e)
+        out.append(x)
+    etat["seq"] = seq
+    try:
+        fc.ajouter_lignes(p_data("evenements.jsonl"), [json.dumps(x, ensure_ascii=False) for x in out])
+    except OSError:
+        pass
+    return out
+
+
+def a_envoyer_evenements(n=20):
+    """Les plus anciens evenements non encore accuses par le tableau de bord (aucun ne se perd)."""
+    ack = (fc.lire_json(p_data("evenements_ack.json"), {}) or {}).get("id", 0)
+    p = p_data("evenements.jsonl")
+    if not os.path.exists(p):
+        return []
+    out = []
+    try:
+        for l in open(p, encoding="utf-8"):
+            try:
+                e = json.loads(l)
+            except ValueError:
+                continue
+            if int(e.get("id", 0)) > ack:
+                out.append(e)
+                if len(out) >= n:
+                    break
+    except OSError:
+        pass
+    return out
+
+
+def accuser_evenements():
+    """Le tableau de bord renvoie evenements_recus = dernier numero garde (a venir cote serveur)."""
+    try:
+        n = int(fc.REPONSE_DIRECT.get("evenements_recus") or 0)
+    except (TypeError, ValueError):
+        return
+    ack = (fc.lire_json(p_data("evenements_ack.json"), {}) or {}).get("id", 0)
+    if n > ack:
+        fc.ecrire_json(p_data("evenements_ack.json"), {"id": n})
+
+
+def par_conv(rec):
+    if rec.get("par_convertisseur") and CONVERTISSEURS:
+        return rec["par_convertisseur"]
+    if rec.get("statut") == "OK":
+        return {"principal": rec.get("valeurs") or {}}
+    return {"principal": {"statut": rec.get("statut")}}
+
+
+def resume(v):
+    return {"ok": 0 if v.get("statut") else 1,
+            "reseau": 1 if (v.get("reseau_tension_v") or 0) > 150 else 0,
+            "mode": v.get("mode_brut"), "avert": v.get("avertissements")}
+
+
+def detecter_evenements(rec, etat, premier):
+    evs = []
+    if premier:
+        avant = fc.lire_json(p_data("dernier.json"), {}) or {}
+        evs.append({"type": "demarrage_boitier", "version": VERSION, "dernier_releve_avant": avant.get("horodatage")})
+    if rec.get("heure_verifiee") and not etat.get("hv_vu"):
+        etat["hv_vu"] = 1
+        if not premier or rec.get("uptime_s", 0) > 300:
+            evs.append({"type": "heure_synchronisee"})
+    if rec.get("detection"):
+        evs.append({"type": "detection_refaite", "raison": rec["detection"]})
+    anc = etat.get("conv") or {}
+    nouv = {}
+    for nom, v in par_conv(rec).items():
+        r = resume(v)
+        nouv[nom] = r
+        a = anc.get(nom)
+        if not a:
+            continue
+        pa = {"conv": nom}
+        if premier:
+            pa["pendant_arret"] = 1               # changement survenu boitier eteint (heure exacte inconnue)
+        if a["ok"] and not r["ok"]:
+            evs.append(dict(pa, type="convertisseur_absent", statut=v.get("statut")))
+            continue
+        if r["ok"] and not a["ok"]:
+            evs.append(dict(pa, type="convertisseur_retour"))
+        if not r["ok"] or not a["ok"]:
+            continue
+        if a["reseau"] and not r["reseau"]:
+            evs.append(dict(pa, type="coupure_reseau", tension_v=v.get("reseau_tension_v")))
+        elif r["reseau"] and not a["reseau"]:
+            evs.append(dict(pa, type="retour_reseau", tension_v=v.get("reseau_tension_v")))
+        if a["mode"] != r["mode"] and r["mode"]:
+            evs.append(dict(pa, type="changement_mode", avant=a["mode"], apres=r["mode"]))
+        if (a["avert"] or "") != (r["avert"] or "") and r["avert"] is not None:
+            evs.append(dict(pa, type="avertissement", avant=a["avert"], apres=r["avert"]))
+    for nom in anc:
+        if nom not in nouv and anc[nom].get("ok"):
+            evs.append({"type": "convertisseur_absent", "conv": nom, "statut": "plus_detecte"})
+    etat["conv"] = dict(anc, **nouv) if not premier else nouv
+    return evs
+
+
+def integrer(rec, etat):
+    """Energie calculee minute par minute (C) : solaire, consommation, charge et decharge batterie. Un intervalle
+    de plus de 6 min (boitier eteint, releve manque) n'est pas compte : jamais d'energie inventee."""
+    if rec.get("statut") != "OK":
+        etat.pop("e_up", None)
+        return
+    v = rec["valeurs"]
+    w = {"pv_kwh": v.get("pv_w"), "charge_kwh": v.get("charge_puissance_w")}
+    b = v.get("batterie_puissance_w")
+    if b is not None:
+        w["batt_charge_kwh"], w["batt_decharge_kwh"] = max(0, b), max(0, -b)
+    up = rec.get("uptime_s") or 0
+    jour = rec["horodatage"][:10] if rec.get("heure_verifiee") else "nv-" + (rec.get("boot") or "")[:8]
+    E = etat.setdefault("energie", {})
+    if jour not in E:
+        E[jour] = (fc.lire_json(p_data("energie.json"), {}) or {}).get(jour) or {}
+    d = E[jour]
+    pu, pw = etat.get("e_up"), etat.get("e_w") or {}
+    if pu is not None and 0 < up - pu <= 360:
+        h = (up - pu) / 3600.0
+        for k, x in w.items():
+            if x is not None and pw.get(k) is not None:
+                d[k] = round(d.get(k, 0) + (x + pw[k]) / 2.0 * h / 1000.0, 4)
+        d["minutes"] = round(d.get("minutes", 0) + (up - pu) / 60.0, 1)
+    etat["e_up"], etat["e_w"] = up, w
+    for j in sorted(E)[:-3]:
+        E.pop(j, None)
+    v["energie_jour"] = {k: round(x, 3) for k, x in d.items()}
+
+
+def sauver_energie(etat):
+    p = p_data("energie.json")
+    tout = fc.lire_json(p, {}) or {}
+    tout.update(etat.get("energie") or {})
+    garde = sorted(k for k in tout if k[:2] == "20")[-730:]
+    tout = {k: tout[k] for k in tout if k in garde or (k.startswith("nv-") and k in (etat.get("energie") or {}))}
+    fc.ecrire_json(p, tout, None)
+
+
+def memoire_du_jour(rec, etat):
+    """Lecture seule, une fois par jour : journal des defauts / reglages SRNE, reglages / drapeaux MPP."""
+    jour = rec["horodatage"][:10] if rec.get("heure_verifiee") else "boot-" + (rec.get("boot") or "")[:8]
+    if etat.get("memoire_jour") == jour:
+        return []
+    etat["memoire_jour"] = jour
+    evs = []
+    os.makedirs(p_data("memoire"), exist_ok=True)
+    for nom, port, marque in CONVERTISSEURS:
+        if not os.path.exists(port) or marque not in ("SRNE", "MPP"):
+            continue
+        brut = {}
+        try:
+            if marque == "SRNE":
+                fc.PORT = port
+                fd = fc.ouvrir()
+                time.sleep(0.3)
+                for a, n in SRNE_MEMOIRE:
+                    r = fc.lire(fd, a, n, essais=2, esclave=adresse_srne(port))
+                    if r is not None:
+                        brut["%04X" % a] = r
+                    time.sleep(0.1)
+                os.close(fd)
+            else:
+                fd = mp.ouvrir(port)
+                time.sleep(0.3)
+                for q in MPP_MEMOIRE:
+                    r, ok = mp.demander(fd, port, q)
+                    if r is not None and ok:
+                        brut[q] = r
+                    time.sleep(0.15)
+                os.close(fd)
+        except OSError:
+            continue
+        if not brut:
+            continue
+        p = p_data("memoire/%s.json" % nom)
+        anc = (fc.lire_json(p, {}) or {}).get("brut") or {}
+        if anc:
+            if marque == "SRNE":
+                vieux = set(tuple(x) for x in journal_srne(anc))
+                neufs = [x for x in journal_srne(brut) if tuple(x) not in vieux]
+                if neufs:
+                    evs.append({"type": "journal_defauts", "conv": nom, "nouveaux": neufs[:8]})
+                reg = [(k, i, anc[k][i], v[i]) for k, v in brut.items() if k.startswith("E") and k in anc
+                       for i in range(min(len(v), len(anc[k]))) if v[i] != anc[k][i]]
+                if reg:
+                    evs.append({"type": "reglages_modifies", "conv": nom,
+                                "changes": ["%04X:%s>%s" % (int(k, 16) + i, a, b) for k, i, a, b in reg[:20]]})
+            else:
+                ch = [q for q in brut if q in anc and brut[q] != anc[q] and q != "QBEQI"]
+                if ch:
+                    evs.append({"type": "reglages_modifies", "conv": nom,
+                                "changes": ["%s:%s>%s" % (q, anc[q], brut[q]) for q in ch]})
+        fc.ecrire_json(p, {"horodatage": rec["horodatage"], "heure_verifiee": rec.get("heure_verifiee"),
+                           "marque": marque, "brut": brut})
+    return evs
+
+
+def journal_srne(brut):
+    """Journal SRNE 0xF800-0xF87F : 8 fiches de 16 registres ; on garde les fiches non vides, brutes."""
+    regs = []
+    for a in ("F800", "F820", "F840", "F860"):
+        regs += brut.get(a) or [None] * 32
+    out = []
+    for i in range(0, len(regs), 16):
+        f = regs[i:i + 16]
+        if None not in f and any(f):
+            out.append(f)
+    return out
+
+
+def ligne_minute(rec):
+    v = rec.get("valeurs") or {}
+    x = {"t": rec["horodatage"], "hv": rec.get("heure_verifiee"), "up": rec.get("uptime_s"), "boot": rec.get("boot"),
+         "s": rec.get("statut")}
+    for k, c in (("batterie_tension_v", "bv"), ("batterie_soc_pct", "soc"), ("batterie_courant_a", "ba"),
+                 ("pv_w", "pv"), ("charge_puissance_w", "w"), ("reseau_tension_v", "rv"), ("mode_brut", "m"),
+                 ("convertisseurs_lus", "lus"), ("temperature_c", "tc")):
+        if v.get(k) is not None:
+            x[c] = v[k]
+    pc = rec.get("par_convertisseur")
+    if pc and len(pc) > 1:
+        x["pc"] = {n: [c.get("statut") or "OK", c.get("reseau_tension_v"), c.get("pv_w"), c.get("charge_puissance_w"),
+                       c.get("mode_brut")] for n, c in pc.items()}
+    return x
+
+
+def vider_minutes():
+    """Lignes minute de la periode : de la memoire vive vers le disque, d'un coup."""
+    try:
+        lignes = open(MINUTES_RAM, encoding="utf-8").read().splitlines()
+    except OSError:
+        return 0
+    par = {}
+    for l in lignes:
+        try:
+            x = json.loads(l)
+        except ValueError:
+            continue
+        f = fc.fichier_stock({"horodatage": x["t"], "heure_verifiee": x.get("hv"), "boot": x.get("boot")}, "min-")
+        par.setdefault(f, []).append(l)
+    for f, ls in par.items():
+        fc.ajouter_lignes(f, ls)
+    os.remove(MINUTES_RAM)
+    return len(lignes)
+
+
+def noter_demarrage(rec):
+    p = p_data("demarrages.json")
+    d = fc.lire_json(p, []) or []
+    if not d or d[-1].get("boot") != rec.get("boot"):
+        d.append({"boot": rec.get("boot"), "t": rec["horodatage"], "hv": rec.get("heure_verifiee"),
+                  "up": rec.get("uptime_s")})
+        fc.ecrire_json(p, d[-200:], None)
+
+
+def cycle(t0, force=False, envoyer=True):
+    """v1.7 : une mesure ; releve complet si la periode est ecoulee (ou force)."""
+    regler_cadence()
+    os.makedirs(fc.RUN, exist_ok=True)
+    etat = fc.lire_json(ETAT_RAM, None)
+    premier = etat is None or etat.get("boot") != fc.boot_id()[:8]
+    if premier:                                           # memoire vive videe : nouveau demarrage du boitier
+        etat = fc.lire_json(p_data("etat_persistant.json"), {}) or {}
+        etat = {"conv": etat.get("conv") or {}, "seq": evenement_seq(), "boot": fc.boot_id()[:8],
+                "memoire_jour": None}
+    up = fc.uptime_s() or 0
+    if not force and etat.get("m_up") is not None and up - etat["m_up"] < MESURE_S - 15:
+        return None                                       # cadence reglee plus lente que le minuteur
+    rec = releve()
+    rec["heure_verifiee"] = 1 if fc.horloge_ok() else 0
+    rec["boot"], rec["uptime_s"] = etat["boot"], fc.uptime_s()
+    evs = detecter_evenements(rec, etat, premier)
+    integrer(rec, etat)
+    etat["m_up"] = up
+    complet = force or premier or etat.get("c_up") is None or up - etat["c_up"] >= COMPLET_S - 20
+    if complet:
+        if premier:
+            noter_demarrage(rec)
+        evs += memoire_du_jour(rec, etat)
+        s = sante(t0)
+        h = etat.setdefault("alertes_sante", {})
+        if s.get("cpu_c") and (s["cpu_c"] >= 75) != bool(h.get("cpu")):
+            h["cpu"] = s["cpu_c"] >= 75
+            evs.append({"type": "temperature_boitier", "cpu_c": s["cpu_c"], "etat": "haute" if h["cpu"] else "normale"})
+        if s.get("disque_libre_pct") is not None and (s["disque_libre_pct"] < 10) != bool(h.get("disque")):
+            h["disque"] = s["disque_libre_pct"] < 10
+            evs.append({"type": "disque_presque_plein", "libre_pct": s["disque_libre_pct"], "etat": "oui" if h["disque"] else "non"})
+        rec["sante"] = s
+    ecrits = ecrire_evenements(evs, rec, etat)
+    if ecrits:
+        rec["evenements_nouveaux"] = [e["type"] + (":" + e["conv"] if e.get("conv") else "") for e in ecrits]
+    fc.ajouter_lignes(MINUTES_RAM, [json.dumps(ligne_minute(rec), ensure_ascii=False)])
+    fc.ecrire_json(os.path.join(fc.RUN, "dernier.json"), rec)
+    if complet:
+        etat["c_up"] = up
+        vider_minutes()
+        fc.recaler()
+        fc.sauver(rec)
+        rec["evenements"] = a_envoyer_evenements()
+        sauver_energie(etat)
+        fc.ecrire_json(p_data("etat_persistant.json"), {"conv": etat.get("conv"), "seq": etat.get("seq"),
+                                                         "horodatage": rec["horodatage"]})
+        if envoyer:
+            rec["direct"] = fc.envoyer_direct(rec)
+            accuser_evenements()
+            # campagne au banc (fichier DATA/BANC) : pas d'historique horaire sous le code du site client
+            rec["envoi"] = "envoi=banc" if os.path.exists(p_data("BANC")) else fc.envoyer(rec)
+        rec.pop("evenements", None)
+    fc.ecrire_json(ETAT_RAM, etat)
+    rec["complet"] = 1 if complet else 0
+    return rec
+
+
 def verrou():
     """v1.1 : attend au plus 60 s que le releve en cours se termine ; sinon abandonne (le suivant passera)."""
     f = open("/run/opti-mpp.lock", "w")
-    fin = time.time() + 60
+    fin = time.time() + 45                        # v1.7 : mesure chaque minute
     while True:
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -620,6 +1071,14 @@ def verrou():
 
 def main():
     fc.releve = releve                            # le reste du cycle (stockage, envoi, direct) est celui de v1.7
+    if "--test" in sys.argv:                     # v1.7 : test apres mise a jour automatique (aucun cable touche)
+        v = srne_valeurs({0x0100: [80, 532, 65524] + [0] * 13, 0x0210: [4] + [0] * 15})
+        assert v and v["batterie_tension_v"] == 53.2 and v["batterie_courant_a"] == 1.2, v
+        v = srne_valeurs({0x0100: [80, 532, 65524] + [0] * 13, 0x0210: [5] + [0] * 15})
+        assert v["batterie_courant_a"] == -1.2 and v["courant_sens"] == "deduit", v
+        assert depuis_qpigs is not None and fc.ecrire_json and fc.recaler and cycle
+        print("test", VERSION, "OK")
+        return
     regler()
     if "--detecter" in sys.argv:                 # v1.4 : pour le technicien / l'atelier
         for nom, port, marque in detecter(forcer=True):
@@ -631,7 +1090,8 @@ def main():
         print("prises vues :", len(prises()))
         return
     if "--show" in sys.argv:
-        p = os.path.join(fc.DATA, "dernier.json")
+        p = os.path.join(fc.RUN, "dernier.json")          # v1.7 : mesure de la minute (memoire vive)
+        p = p if os.path.exists(p) else os.path.join(fc.DATA, "dernier.json")
         if not os.path.exists(p):
             sys.exit("Aucun releve pour l'instant.")
         d = json.load(open(p))
@@ -642,18 +1102,34 @@ def main():
             print("  [%s] batterie=%s V pv=%s W charge=%s W temp=%s C %s" % (nom, v.get("batterie_tension_v"),
                   v.get("pv_w"), v.get("charge_puissance_w"), v.get("temperature_c"), v.get("statut", "")))
         return
+    if "--evenements" in sys.argv:               # v1.7 : 30 derniers evenements
+        p = p_data("evenements.jsonl")
+        for l in (open(p, encoding="utf-8").read().splitlines()[-30:] if os.path.exists(p) else []):
+            try:
+                e = json.loads(l)
+            except ValueError:
+                continue
+            print("%5s %s%s %-22s %s" % (e.get("id"), e.get("t"), "" if e.get("hv", 1) else " (heure non verifiee)",
+                  e.get("type"), " ".join("%s=%s" % (k, x) for k, x in e.items()
+                                            if k not in ("id", "t", "hv", "type", "boot", "site", "up"))))
+        return
+    if "--sante" in sys.argv:                    # v1.7
+        for k, x in sante(time.time()).items():
+            print("  %-20s %s" % (k, x))
+        print("  %-20s %s" % ("heure_verifiee", fc.horloge_ok()))
+        return
     garde = verrou()                              # v1.1
-    rec = releve()
-    fc.sauver(rec)
-    if "--sans-envoi" not in sys.argv:
-        rec["direct"] = fc.envoyer_direct(rec)
-        rec["envoi"] = fc.envoyer(rec)
+    t0 = time.time()
+    rec = cycle(t0, force="--sans-envoi" in sys.argv or "--complet" in sys.argv, envoyer="--sans-envoi" not in sys.argv)
+    if rec is None:
+        return
     v = rec.get("valeurs", {})
-    print("%s %s mode=%s batterie=%s V %s %% charge=%s W pv=%s W reseau=%s V convertisseurs=%s/%s" % (
-        rec["horodatage"], rec["statut"], v.get("mode_brut"), v.get("batterie_tension_v"), v.get("batterie_soc_pct"),
-        v.get("charge_puissance_w"), v.get("pv_w"), v.get("reseau_tension_v"), v.get("convertisseurs_lus", 1),
-        v.get("convertisseurs_attendus", 1)), rec.get("direct", ""), rec.get("envoi", ""))
-
+    print("%s %s%s mode=%s batterie=%s V %s %% %s A charge=%s W pv=%s W reseau=%s V convertisseurs=%s/%s %s" % (
+        rec["horodatage"], rec["statut"], "" if rec.get("heure_verifiee") else " (heure non verifiee)", v.get("mode_brut"),
+        v.get("batterie_tension_v"), v.get("batterie_soc_pct"), v.get("batterie_courant_a"), v.get("charge_puissance_w"),
+        v.get("pv_w"), v.get("reseau_tension_v"), v.get("convertisseurs_lus", 1), v.get("convertisseurs_attendus", 1),
+        "complet" if rec.get("complet") else "minute"), rec.get("direct", ""), rec.get("envoi", ""),
+        ("evenements: " + ", ".join(rec["evenements_nouveaux"])) if rec.get("evenements_nouveaux") else "")
 
 if __name__ == "__main__":
     main()
