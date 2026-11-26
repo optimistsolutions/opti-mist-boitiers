@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OPTI-MIST SOLUTIONS - Lecteur universel : MPP / Voltronic (PI30), SRNE et Felicity (Modbus) - v1.6a du 25/11/2026
+OPTI-MIST SOLUTIONS - Lecteur universel : MPP / Voltronic (PI30), SRNE et Felicity (Modbus) - v1.6b du 26/11/2026
+v1.6b (26/11 21h, banc, SRNE HYP4860S100-H 6,2 kVA) : ADRESSE MODBUS DU SRNE. Ce SRNE etait regle sur l'adresse 2
+  (ecran « Id: 2 », M) ; la detection ne l'essayait qu'a l'adresse 1 -> non reconnu (M 20h56). Desormais, a la
+  detection, adresses 1 a 9 essayees une par une (Felicity 0x1100 puis SRNE 0x0100, lecture seule fonction 03) ;
+  l'adresse trouvee est gardee dans detection.json (unites) et sert a la lecture et au numero de serie.
+  Carte HESP verifiee sur le HYP par la sonde (M 21h02 = ecran) : 51,8 V, +1,2 A, reseau 233,5 V / 49,97 Hz, bus 399,6 V,
+  49,0 C, etat 4 = reseau. phase_max_w (0x020C) n'est garde qu'en triphase : sur le HYP il vaut 9729 (autre sens, M).
 v1.6a (25/11, GO S.S. boitier universel) : commentaires seulement (aucun nom de client, pour le depot public) ; code identique a v1.6.
 v1.6 (24/11 13h30, GO S.S. apres la sonde OPTI-063 du 24/11, carte boitiers/sonde/CARTE_SRNE_OPTI-063_2026-11-24.md) :
   SRNE TRIPHASE A 2 ENTREES PV (OPTI-063, 48 V / 20 kW). En v1.5d : solaire = PV1 seul (moitie du reel) et
@@ -95,7 +101,7 @@ sys.path.insert(0, ICI)
 import felicity_collect as fc      # stockage, rattrapage, envoi (v1.7)
 import mpp_probe as mp             # trame, CRC, liaison serie / USB (v1.1)
 
-VERSION = "mpp 1.6a"
+VERSION = "mpp 1.6b"
 SRNE = [("batterie_soc_pct", 0x0100, False, 1), ("batterie_tension_v", 0x0101, False, 10),
         ("batterie_courant_a", 0x0102, True, 10), ("pv1_tension_v", 0x0107, False, 10),
         ("pv1_courant_a", 0x0108, False, 10), ("pv1_puissance_w", 0x0109, False, 1),
@@ -115,6 +121,7 @@ CHARGEUR = None                    # v1.4
 AUTO = False                       # v1.5 : convertisseurs = auto
 ATTENDUS = 0                       # v1.5c : cle convertisseurs_attendus (0 = automatique, 7 jours)
 CLES = {}                          # v1.5 : {prise: identite} de la derniere detection
+ADR_SRNE = {}                      # v1.6b : {prise SRNE: adresse Modbus trouvee a la detection}
 UNITES_PRISE = {}                  # v1.5d : {prise Felicity: [adresses Modbus qui repondent]}
 ESCLAVES_CONF = []                 # v1.5d : cle esclaves de envoi.conf (prioritaire)
 FC_RELEVE = fc.releve              # v1.4 : releve Felicity d'origine (avant remplacement dans main)
@@ -191,16 +198,21 @@ def identifier(port):
     try:
         fd = fc.ouvrir()
         time.sleep(0.3)
-        felicity = fc.lire(fd, 0x1100, 1, 2, 1)
-        srne = None if felicity is not None else fc.lire(fd, 0x0100, 2, 2, 1)
+        trouve = None
+        for a in range(1, 10):                                # v1.6b : adresses 1 a 9 (SRNE HYP regle sur 2, M)
+            if fc.lire(fd, 0x1100, 1, 2, a) is not None:
+                trouve = "FELICITY"
+                break
+            srne = fc.lire(fd, 0x0100, 2, 2, a)
+            if srne is not None and 200 <= srne[1] <= 700:   # tension batterie 20-70 V (/10) : garde-fou
+                trouve = "SRNE"
+                ADR_SRNE[port] = a
+                break
+            time.sleep(0.05)
         os.close(fd)
     except OSError:
         return None
-    if felicity is not None:
-        return "FELICITY"
-    if srne is not None and 200 <= srne[1] <= 700:           # tension batterie 20-70 V (/10) : garde-fou
-        return "SRNE"
-    return None
+    return trouve
 
 
 def serie(port, marque):
@@ -217,7 +229,7 @@ def serie(port, marque):
             fc.PORT = port
             fd = fc.ouvrir()
             time.sleep(0.3)
-            r = fc.lire(fd, 0x0035, 20, 2, 1)
+            r = fc.lire(fd, 0x0035, 20, 2, adresse_srne(port))     # v1.6b
             os.close(fd)
             if r:
                 b = b"".join(v.to_bytes(2, "big") for v in r).replace(b"\x00", b"").strip()
@@ -311,6 +323,8 @@ def detecter(forcer=False):
         cles[port] = cle
         if m == "FELICITY":
             unites[port] = adresses_felicity(port)
+        elif m == "SRNE":
+            unites[port] = [ADR_SRNE.get(port, 1)]          # v1.6b : adresse gardee pour la lecture
     conv.sort(key=lambda c: c[0])
     os.makedirs(fc.DATA, exist_ok=True)
     json.dump(ids, open(os.path.join(fc.DATA, "identites.json"), "w"), indent=1)
@@ -415,7 +429,7 @@ def srne_valeurs(blocs):
             tri[nom] = round(x / div, 2) if div != 1 else x
     pvt = tri.pop("pv_total_w", None)
     val["pv_w"] = pvt if pvt is not None and pvt >= pv1 else pv1
-    for k in ("pv2_tension_v", "pv_jour_kwh", "phase_max_w"):
+    for k in ("pv2_tension_v", "pv_jour_kwh"):          # v1.6b : phase_max_w seulement en triphase
         if k in tri:
             val[k] = tri.pop(k)
     for nom, a in (("pv_total_kwh", 0xF038), ("conso_total_kwh", 0xF03A)):
@@ -434,6 +448,11 @@ def srne_valeurs(blocs):
     return val
 
 
+def adresse_srne(port):
+    """v1.6b : adresse Modbus du SRNE sur cette prise (detection, sinon cle esclaves de envoi.conf, sinon 1)."""
+    return ADR_SRNE.get(port) or (UNITES_PRISE.get(port) or ESCLAVES_CONF or [1])[0]
+
+
 def lire_srne(port):
     """v1.3 : SRNE en Modbus RTU, fonction 03 uniquement (fc.lire). v1.6 : blocs triphase et compteurs."""
     fc.PORT = port
@@ -441,7 +460,7 @@ def lire_srne(port):
         fd = fc.ouvrir()
         blocs = {}
         for a, n in SRNE_BLOCS:
-            r = fc.lire(fd, a, n, essais=4 if a in (0x0100, 0x0210) else 1, esclave=1)   # v1.6 : blocs facultatifs, 1 essai
+            r = fc.lire(fd, a, n, essais=4 if a in (0x0100, 0x0210) else 1, esclave=adresse_srne(port))   # v1.6b
             if r is not None:
                 blocs[a] = r
             time.sleep(0.1)
