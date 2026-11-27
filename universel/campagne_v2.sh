@@ -1,5 +1,5 @@
 #!/bin/sh
-# OPTI-MIST SOLUTIONS - campagne de validation au banc du lecteur universel v1.7 - v2.2 du 27/11/2026 (v2.2 : fin eteint le boitier sans relancer la mesure, bilan controle la mise a jour a distance ; v2.1 : scenario 8b)
+# OPTI-MIST SOLUTIONS - campagne de validation au banc du lecteur universel v1.7 - v2.3 du 27/11/2026 (v2.3 : chien de garde controle dans le journal du systeme, plus seulement la presence du fichier ; v2.2 : fin eteint le boitier sans relancer la mesure, bilan controle la mise a jour a distance ; v2.1 : scenario 8b)
 # GO S.S. 26/11 22h50 : tout est valide au banc avant la pose du 28/11 (un boitier pose ne revient plus au banc).
 # Lecture seule des convertisseurs. Un seul script par boitier, 4 commandes :
 #   sh /root/campagne_v2.sh prepare   installe la v1.7 depuis /root (install_universel v1.1), controle l'installation,
@@ -35,7 +35,11 @@ prepare)
   for f in mpp_collect.py felicity_collect.py mpp_probe.py; do echo "  $f $(sha256sum /opt/opti061/$f | cut -c1-8)"; done
   python3 /opt/opti061/mpp_collect.py --test
   grep -q 'OnCalendar=\*:\*:00' /etc/systemd/system/opti-mpp.timer && echo "  minuteur chaque minute : OUI" || echo "  minuteur chaque minute : NON"
-  [ -e /dev/watchdog ] && [ -f /etc/systemd/system.conf.d/opti-watchdog.conf ] && echo "  chien de garde : OUI ($(systemctl show -p RuntimeWatchdogUSec --value))" || echo "  chien de garde : NON"
+  WD=$(journalctl -b --no-pager 2>/dev/null | grep -iE "watchdog hardware timeout|Watchdog running with a hardware timeout" | tail -1)
+  case "$WD" in
+    *"Watchdog running with a hardware timeout"*) echo "  chien de garde : OUI (${WD##*timeout of }, confirme par le systeme)" ;;
+    *) echo "  chien de garde : NON - ROUGE (journal : ${WD:-aucune ligne}) ; corriger avant la pose" ;;
+  esac
   echo "  redemarrage sur panne du noyau : $(cat /proc/sys/kernel/panic) s"
   echo "  heure synchronisee : $(timedatectl show -p NTPSynchronized --value)"
   echo "  mise a jour automatique : $(grep -c '^\[composant' /etc/opti-maj/maj.conf 2>/dev/null) composant(s)"

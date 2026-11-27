@@ -1,5 +1,8 @@
 #!/bin/sh
-# OPTI-MIST SOLUTIONS - Installation du LECTEUR UNIVERSEL (MPP / Voltronic, Felicity, SRNE ; lecture seule) - v1.2 du 27/11/2026
+# OPTI-MIST SOLUTIONS - Installation du LECTEUR UNIVERSEL (MPP / Voltronic, Felicity, SRNE ; lecture seule) - v1.3 du 27/11/2026
+# v1.3 (27/11 11h20, banc OPTI-108, M) : la carte H6 refuse un chien de garde de 30 s (maximum 16 s, sunxi-wdt) ;
+#   systemd l'ignorait ("Failed to set watchdog hardware timeout to 30s") et la carte restait figee apres un blocage.
+#   Reglage a 10 s (redemarrage seul en 19 s, M) et controle reel dans le journal du systeme.
 # v1.2 (27/11, veille forums Armbian / Solar Assistant, checking etendu GO S.S. 26/11 23h52) : boitier FIGE pour la duree
 #   (pose sans retour) : mises a jour automatiques du systeme coupees et noyau bloque (une mise a jour a deja empeche des
 #   Orange Pi 3 LTS de redemarrer, forums) ; processeur plafonne a 1,2 GHz (chaleur en coffret 55-60 C : un H6 vers 80-90 C
@@ -119,9 +122,14 @@ timedatectl set-ntp true 2>/dev/null || true
 # v1.1 : chien de garde materiel, redemarrage sur panne du noyau, journal plafonne
 if [ -e /dev/watchdog ]; then
   install -d /etc/systemd/system.conf.d
-  printf "[Manager]\nRuntimeWatchdogSec=30\nRebootWatchdogSec=2min\n" > /etc/systemd/system.conf.d/opti-watchdog.conf
+  printf "[Manager]\nRuntimeWatchdogSec=10\nRebootWatchdogSec=2min\n" > /etc/systemd/system.conf.d/opti-watchdog.conf
   systemctl daemon-reexec
-  echo "Chien de garde materiel actif (30 s)"
+  sleep 2
+  if journalctl -b --no-pager 2>/dev/null | grep -q "Watchdog running with a hardware timeout"; then
+    echo "Chien de garde materiel actif (10 s, confirme par le systeme)"
+  else
+    echo "ATTENTION : chien de garde materiel NON confirme par le systeme"
+  fi
 else
   echo "ATTENTION : /dev/watchdog absent - chien de garde materiel NON actif"
 fi
