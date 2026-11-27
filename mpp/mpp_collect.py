@@ -29,6 +29,12 @@ v1.7a (27/11 00h, veille forums Solar Assistant / Armbian / Victron, GO S.S. 26/
   du boitier (evenement redemarrage_auto), au plus une fois toutes les 6 h. Rien n'est envoye au convertisseur.
   Nouvelle detection sur convertisseur muet : au plus une fois toutes les 10 min (elle dure 40 a 90 s ; chaque minute,
   elle aurait empeche la mesure des autres convertisseurs, C).
+v1.7d (27/11 16h, GO S.S. 15h54, cas OPTI-098 CREUSET : Felicity jamais reconnu, 2 convertisseurs sur 3) :
+  DIAGNOSTIC DES PRISES A DISTANCE, sans port ouvert : quand un convertisseur attendu manque ou qu'une prise ne donne
+  rien, le releve complet joint (sante.diag, au plus toutes les 30 min) pour chaque prise : adaptateur USB (fabricant,
+  modele, pilote), convertisseur lu dessus, et pour une prise muette des essais en LECTURE SEULE (QPI a 2400 bauds,
+  Modbus fonction 03 registre 0x1100 adresses 1-3 a 9600, adresse 1 a 2400 et 19200) avec les octets recus et un verdict
+  (rien recu = cable / port / cablage ; octets illisibles = vitesse ou protocole ; reponse = appareil reconnaissable).
 v1.7c (27/11 12h30, banc OPTI-112, M) : (1) au RETOUR d'un convertisseur (cable rebranche), son etat est compare au
   dernier etat connu AVANT l'absence : coupure / retour du reseau, mode et avertissement survenus pendant l'absence sont
   dates (pendant_absence=1) au lieu d'etre perdus (le retour reseau du MPP a 12:13 manquait) ; l'etat d'un convertisseur
@@ -147,7 +153,7 @@ sys.path.insert(0, ICI)
 import felicity_collect as fc      # stockage, rattrapage, envoi (v1.7)
 import mpp_probe as mp             # trame, CRC, liaison serie / USB (v1.1)
 
-VERSION = "mpp 1.7c"
+VERSION = "mpp 1.7d"
 SRNE = [("batterie_soc_pct", 0x0100, False, 1), ("batterie_tension_v", 0x0101, False, 10),
         ("batterie_courant_a", 0x0102, True, 10), ("pv1_tension_v", 0x0107, False, 10),
         ("pv1_courant_a", 0x0108, False, 10), ("pv1_puissance_w", 0x0109, False, 1),
@@ -1066,6 +1072,96 @@ def reinitialiser_usb(port):
         return "echec %s" % e.__class__.__name__
 
 
+DIAG_PERIODE_S = 1800
+
+
+def _lire_sys(d, f):
+    try:
+        return open(os.path.join(d, f)).read().strip()[:40]
+    except (OSError, TypeError):
+        return None
+
+
+def _essai_brut(port, baud, trame, attente):
+    """v1.7d : envoie une trame de LECTURE et renvoie les octets recus (au plus 48). Jamais d'ecriture de reglage."""
+    import termios, tty, select
+    fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        tty.setraw(fd)
+        a = termios.tcgetattr(fd)
+        a[4] = a[5] = {2400: termios.B2400, 9600: termios.B9600, 19200: termios.B19200}[baud]
+        a[2] = (a[2] & ~(termios.PARENB | termios.CSTOPB | termios.CSIZE)) | termios.CS8 | termios.CLOCAL | termios.CREAD
+        termios.tcsetattr(fd, termios.TCSANOW, a)
+        termios.tcflush(fd, termios.TCIOFLUSH)
+        os.write(fd, trame)
+        buf, fin = b"", time.time() + attente
+        while time.time() < fin and len(buf) < 48:
+            if select.select([fd], [], [], 0.05)[0]:
+                try:
+                    buf += os.read(fd, 64)
+                except BlockingIOError:
+                    pass
+        return buf[:48]
+    finally:
+        os.close(fd)
+
+
+def diagnostic_prises(rec, budget_s=10.0):
+    """v1.7d : etat de chaque prise, et essais en lecture seule sur les prises ou rien n'est lu."""
+    t0 = time.time()
+    par = rec.get("par_convertisseur") or {}
+    sur_prise = {}
+    for nom, port, marque in CONVERTISSEURS or []:
+        sur_prise.setdefault(os.path.realpath(port), []).append(
+            "%s:%s" % (nom, "lu" if not (par.get(nom) or {}).get("statut") else (par.get(nom) or {}).get("statut")))
+    out = []
+    for port in prises():
+        reel = os.path.realpath(port)
+        u = usb_parent(port)
+        drv = None
+        try:
+            drv = os.path.basename(os.path.realpath("/sys/class/tty/%s/device/driver" % os.path.basename(reel)))
+        except OSError:
+            pass
+        x = {"prise": os.path.basename(port)[-40:], "dev": os.path.basename(reel),
+             "usb": "%s:%s" % (_lire_sys(u, "idVendor"), _lire_sys(u, "idProduct")) if u else None,
+             "fabricant": _lire_sys(u, "manufacturer"), "modele": _lire_sys(u, "product"), "pilote": drv,
+             "conv": sur_prise.get(reel) or []}
+        if any(c.endswith(":lu") for c in x["conv"]) or "hidraw" in reel:
+            x["verdict"] = "lu" if x["conv"] else "usb_direct"
+            out.append(x)
+            continue
+        essais, recu = [], 0
+        plan = [("QPI", 2400, mp.trame("QPI"), 1.5)]
+        for adr, baud in ((1, 9600), (2, 9600), (3, 9600), (1, 2400), (1, 19200)):
+            q = bytes([adr, 3, 0x11, 0x00, 0, 1])
+            plan.append(("MB%d@%d" % (adr, baud), baud, q + fc.crc16(q), 0.8))
+        for nom, baud, trame, att in plan:
+            if time.time() - t0 > budget_s:
+                essais.append({"essai": nom, "saute": "budget"})
+                continue
+            try:
+                b = _essai_brut(port, baud, trame, att)
+                recu += len(b)
+                essais.append({"essai": nom, "octets": len(b), "hex": b[:24].hex()})
+            except (OSError, KeyError) as e:
+                essais.append({"essai": nom, "erreur": "%s %s" % (type(e).__name__, getattr(e, "errno", ""))})
+        x["essais"] = essais
+        ok = [e for e in essais if e.get("octets")]
+        if any(e.get("erreur") for e in essais) and not ok:
+            x["verdict"] = "prise_inutilisable"
+        elif not ok:
+            x["verdict"] = "rien_recu"                 # cable, port de l'appareil, cablage RS485 A/B, appareil eteint
+        elif any(e["hex"].startswith("28") for e in ok):
+            x["verdict"] = "reponse_pi30"
+        elif any(len(e["hex"]) >= 10 and e["hex"][2:4] in ("03", "83") for e in ok):
+            x["verdict"] = "reponse_modbus"
+        else:
+            x["verdict"] = "octets_illisibles"         # vitesse ou protocole different
+        out.append(x)
+    return {"t": rec.get("horodatage"), "version": VERSION, "duree_s": round(time.time() - t0, 1), "prises": out}
+
+
 def guerir(rec, etat):
     """Convertisseur muet 5 min (lu auparavant dans ce demarrage) -> reinitialisation de sa prise USB (1 fois / 30 min).
     Tous muets 30 min -> redemarrage du boitier, au plus une fois toutes les 6 h (DATA/redemarrage_auto.json)."""
@@ -1209,6 +1305,16 @@ def cycle(t0, force=False, envoyer=True):
             h["disque"] = s["disque_libre_pct"] < 10
             evs.append({"type": "disque_presque_plein", "libre_pct": s["disque_libre_pct"], "etat": "oui" if h["disque"] else "non"})
         rec["sante"] = s
+        try:                                              # v1.7d : diagnostic des prises si un convertisseur manque
+            v = rec.get("valeurs") or {}
+            manque = (v.get("convertisseurs_lus") is not None and v.get("convertisseurs_attendus") is not None
+                      and v["convertisseurs_lus"] < v["convertisseurs_attendus"]) or rec.get("statut") != "OK" \
+                     or len(prises()) > len(CONVERTISSEURS or [])
+            if manque and (premier or up - (etat.get("diag_up") or -1e9) >= DIAG_PERIODE_S) and time.time() - t0 < 25:
+                s["diag"] = diagnostic_prises(rec)
+                etat["diag_up"] = up
+        except Exception as e:
+            s["diag_erreur"] = type(e).__name__
     ecrits = ecrire_evenements(evs, rec, etat)
     if ecrits:
         rec["evenements_nouveaux"] = [e["type"] + (":" + e["conv"] if e.get("conv") else "") for e in ecrits]
