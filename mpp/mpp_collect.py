@@ -29,6 +29,12 @@ v1.7a (27/11 00h, veille forums Solar Assistant / Armbian / Victron, GO S.S. 26/
   du boitier (evenement redemarrage_auto), au plus une fois toutes les 6 h. Rien n'est envoye au convertisseur.
   Nouvelle detection sur convertisseur muet : au plus une fois toutes les 10 min (elle dure 40 a 90 s ; chaque minute,
   elle aurait empeche la mesure des autres convertisseurs, C).
+v1.7c (27/11 12h30, banc OPTI-112, M) : (1) au RETOUR d'un convertisseur (cable rebranche), son etat est compare au
+  dernier etat connu AVANT l'absence : coupure / retour du reseau, mode et avertissement survenus pendant l'absence sont
+  dates (pendant_absence=1) au lieu d'etre perdus (le retour reseau du MPP a 12:13 manquait) ; l'etat d'un convertisseur
+  absent garde ses dernieres valeurs valides. (2) L'etat des convertisseurs est ecrit sur le disque A CHAQUE EVENEMENT
+  (et non seulement toutes les 5 min) : apres une coupure du boitier, on ne repart plus d'un etat vieux de 5 min
+  (le MPP restait « coupe » dans le journal apres le redemarrage de 12:18:49).
 v1.7b (27/11 01h, checking etendu : relecture contradictoire independante + veille forums, GO S.S. 26/11 23h52) :
   - un convertisseur muet pendant une detection n'est plus jamais retire de la liste tant que sa prise existe (avant :
     muet 1 min = retire pour toujours, boitier aveugle) ; detection refaite a chaque demarrage ; cache vide jamais repris ;
@@ -141,7 +147,7 @@ sys.path.insert(0, ICI)
 import felicity_collect as fc      # stockage, rattrapage, envoi (v1.7)
 import mpp_probe as mp             # trame, CRC, liaison serie / USB (v1.1)
 
-VERSION = "mpp 1.7b"
+VERSION = "mpp 1.7c"
 SRNE = [("batterie_soc_pct", 0x0100, False, 1), ("batterie_tension_v", 0x0101, False, 10),
         ("batterie_courant_a", 0x0102, True, 10), ("pv1_tension_v", 0x0107, False, 10),
         ("pv1_courant_a", 0x0108, False, 10), ("pv1_puissance_w", 0x0109, False, 1),
@@ -869,16 +875,21 @@ def detecter_evenements(rec, etat, premier):
         nouv[nom] = r
         if not a:
             continue
+        if not r["ok"]:                               # v1.7c : un absent garde ses dernieres valeurs valides
+            nouv[nom] = dict(a, ok=0)
         pa = {"conv": nom}
         if premier:
             pa["pendant_arret"] = 1               # changement survenu boitier eteint (heure exacte inconnue)
         if a["ok"] and not r["ok"]:
             evs.append(dict(pa, type="convertisseur_absent", statut=v.get("statut")))
             continue
-        if r["ok"] and not a["ok"]:
-            evs.append(dict(pa, type="convertisseur_retour"))
-        if not r["ok"] or not a["ok"]:
+        if not r["ok"]:
             continue
+        if not a["ok"]:
+            evs.append(dict(pa, type="convertisseur_retour"))
+            if a.get("reseau") is None:               # aucun etat valide connu avant l'absence : rien a comparer
+                continue
+            pa["pendant_absence"] = 1             # v1.7c : survenu pendant l'absence (heure exacte inconnue)
         if a["reseau"] and not r["reseau"]:
             evs.append(dict(pa, type="coupure_reseau", tension_v=v.get("reseau_tension_v")))
         elif r["reseau"] and not a["reseau"]:
@@ -1201,6 +1212,11 @@ def cycle(t0, force=False, envoyer=True):
     ecrits = ecrire_evenements(evs, rec, etat)
     if ecrits:
         rec["evenements_nouveaux"] = [e["type"] + (":" + e["conv"] if e.get("conv") else "") for e in ecrits]
+        try:                                              # v1.7c : etat ecrit sur le disque a chaque evenement
+            fc.ecrire_json(p_data("etat_persistant.json"), {"conv": etat.get("conv"), "seq": etat.get("seq"),
+                                                             "horodatage": rec.get("horodatage")})
+        except OSError:
+            pass
     fc.ajouter_lignes(MINUTES_RAM, [json.dumps(ligne_minute(rec), ensure_ascii=True)])
     fc.ecrire_json(os.path.join(fc.RUN, "dernier.json"), rec)
     if complet:
