@@ -15,6 +15,7 @@ Usage (en root sur le boitier) :
   python3 mpp_probe.py                        -> essaie /dev/hidraw0, /dev/ttyUSB0, /dev/ttyUSB1 (le premier qui repond)
   python3 mpp_probe.py /dev/ttyUSB0           -> port impose
   python3 mpp_probe.py /dev/ttyUSB0 --tous    -> toutes les questions, meme si le protocole est deja reconnu
+  python3 mpp_probe.py /dev/ttyUSB0 --memoire -> v1.2 : en plus, memoire et energie (QFLAG, QET, QEY, QEM, QED, QBEQI)
 Resultat a l'ecran et dans /var/lib/opti-mist/mpp_probe_AAAA-MM-JJ_HHMM.json (a transmettre a Claude, sans capture d'autre chose).
 """
 import datetime as dt, json, os, select, sys, termios, time, tty
@@ -36,6 +37,13 @@ QUESTIONS = [
     ("PI18", "^P005GS"),  # mesures generales PI18
     ("PI18", "^P006MOD"), # mode PI18
 ]
+# v1.2 (26/11, campagne banc) : option --memoire = questions de memoire et d'energie (PI30, interrogation seule ;
+# reponse ou NAK selon le modele, S) : drapeaux, energie PV totale / annee / mois / jour.
+_J = dt.date.today()
+MEMOIRE = [("PI30", "QFLAG"), ("PI30", "QET"), ("PI30", "QEY%04d" % _J.year), ("PI30", "QEM%04d%02d" % (_J.year, _J.month)),
+           ("PI30", "QED%04d%02d%02d" % (_J.year, _J.month, _J.day)), ("PI30", "QBEQI")]
+for _p, _q in MEMOIRE:      # garde-fou : interrogations seulement
+    assert _q.startswith("Q"), _q
 for _p, _q in QUESTIONS:   # garde-fou : rien d'autre que des interrogations
     assert _q.startswith("Q") or _q.startswith("^P"), _q
 
@@ -115,12 +123,12 @@ def decoder_qpigs(t):
     return out
 
 
-def sonder(port, tous):
+def sonder(port, tous, memoire=False):
     res = {"port": port, "reponses": {}}
     fd = ouvrir(port)
     time.sleep(0.3)
     try:
-        for proto, q in QUESTIONS:
+        for proto, q in QUESTIONS + (MEMOIRE if memoire else []):
             if not tous and proto == "PI18" and res.get("protocole") == "PI30":
                 continue
             r, crc = demander(fd, port, q)
@@ -141,14 +149,15 @@ def sonder(port, tous):
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     tous = "--tous" in sys.argv
+    memoire = "--memoire" in sys.argv
     ports = args or ["/dev/hidraw0", "/dev/ttyUSB0", "/dev/ttyUSB1"]
-    resultat = {"outil": "mpp_probe 1.0", "horodatage": dt.datetime.now().astimezone().isoformat(timespec="seconds"), "essais": []}
+    resultat = {"outil": "mpp_probe 1.2", "horodatage": dt.datetime.now().astimezone().isoformat(timespec="seconds"), "essais": []}
     for p in ports:
         if not os.path.exists(p):
             resultat["essais"].append({"port": p, "absent": True})
             continue
         try:
-            r = sonder(p, tous)
+            r = sonder(p, tous, memoire)
         except OSError as e:
             resultat["essais"].append({"port": p, "erreur": str(e)})
             continue

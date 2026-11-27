@@ -1,5 +1,9 @@
 #!/bin/sh
-# OPTI-MIST SOLUTIONS - Installation du LECTEUR UNIVERSEL (MPP / Voltronic, Felicity, SRNE ; lecture seule) - v1.1 du 27/11/2026
+# OPTI-MIST SOLUTIONS - Installation du LECTEUR UNIVERSEL (MPP / Voltronic, Felicity, SRNE ; lecture seule) - v1.2 du 27/11/2026
+# v1.2 (27/11, veille forums Armbian / Solar Assistant, checking etendu GO S.S. 26/11 23h52) : boitier FIGE pour la duree
+#   (pose sans retour) : mises a jour automatiques du systeme coupees et noyau bloque (une mise a jour a deja empeche des
+#   Orange Pi 3 LTS de redemarrer, forums) ; processeur plafonne a 1,2 GHz (chaleur en coffret 55-60 C : un H6 vers 80-90 C
+#   ralentit et gele, forums) ; Bluetooth coupe.
 # v1.1 (27/11, GO S.S. 26/11 22h50 - boitiers poses le 28/11, sans retour au banc) : mpp_collect v1.7 requis ;
 #   minuteur CHAQUE MINUTE (la cadence reelle se regle dans envoi.conf : mesure_s, complet_min) ; CHIEN DE GARDE
 #   materiel (systemd le nourrit toutes les 15 s ; noyau bloque -> redemarrage en 30 s) ; noyau en panne ou erreur
@@ -41,6 +45,7 @@ if [ -f "$CONF" ]; then
   [ "$ANCIEN" = "$CODE" ] || { echo "envoi.conf est au code $ANCIEN, pas $CODE : arret (rien n'est change)"; exit 1; }
   grep -q '^convertisseurs *=' "$CONF" || printf "convertisseurs = auto\n" >> "$CONF"
   [ -z "$ESCL" ] || grep -q '^esclaves *=' "$CONF" || printf "esclaves = %s\n" "$ESCL" >> "$CONF"
+  chmod 600 "$CONF"                                  # v1.2
   echo "envoi.conf garde ($CODE) ; detection automatique des prises activee"
 else
   cat > "$CONF" <<EOC
@@ -120,6 +125,18 @@ if [ -e /dev/watchdog ]; then
 else
   echo "ATTENTION : /dev/watchdog absent - chien de garde materiel NON actif"
 fi
+# v1.2 : systeme fige (aucune mise a jour automatique, noyau bloque) ; processeur plafonne ; Bluetooth coupe
+systemctl disable --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+for p in $(dpkg-query -W -f='${Package}\n' 2>/dev/null | grep -E '^(linux-image|linux-dtb|linux-u-boot|armbian-firmware|armbian-bsp)'); do
+  apt-mark hold "$p" >/dev/null 2>&1 || true
+done
+echo "Mises a jour automatiques coupees ; noyau bloque ($(apt-mark showhold 2>/dev/null | wc -l) paquet(s))"
+if [ -d /sys/devices/system/cpu/cpu0/cpufreq ]; then
+  printf 'ENABLE=true\nGOVERNOR=schedutil\nMIN_SPEED=480000\nMAX_SPEED=1200000\n' > /etc/default/cpufrequtils
+  for c in /sys/devices/system/cpu/cpu*/cpufreq; do echo 1200000 > $c/scaling_max_freq 2>/dev/null || true; done
+  echo "Processeur plafonne a 1,2 GHz : $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null)"
+fi
+systemctl disable --now bluetooth.service 2>/dev/null || true
 printf "kernel.panic = 10\nkernel.panic_on_oops = 1\n" > /etc/sysctl.d/90-opti.conf
 sysctl -q -p /etc/sysctl.d/90-opti.conf || true
 install -d /etc/systemd/journald.conf.d
