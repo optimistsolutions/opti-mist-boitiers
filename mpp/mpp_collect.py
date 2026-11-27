@@ -29,6 +29,19 @@ v1.7a (27/11 00h, veille forums Solar Assistant / Armbian / Victron, GO S.S. 26/
   du boitier (evenement redemarrage_auto), au plus une fois toutes les 6 h. Rien n'est envoye au convertisseur.
   Nouvelle detection sur convertisseur muet : au plus une fois toutes les 10 min (elle dure 40 a 90 s ; chaque minute,
   elle aurait empeche la mesure des autres convertisseurs, C).
+v1.7b (27/11 01h, checking etendu : relecture contradictoire independante + veille forums, GO S.S. 26/11 23h52) :
+  - un convertisseur muet pendant une detection n'est plus jamais retire de la liste tant que sa prise existe (avant :
+    muet 1 min = retire pour toujours, boitier aveugle) ; detection refaite a chaque demarrage ; cache vide jamais repris ;
+  - « convertisseur absent » une seule fois (avant : chaque minute) ; mode et avertissements MPP pris seulement sur
+    trame controlee (pas de faux evenement sur une trame abimee) ; numeros d'evenements sans doublon ;
+  - heure testee AVANT la lecture ; energie comptee avant la synchronisation reportee sur le jour reel ;
+  - budget de temps : detection sur muet et memoire du jour seulement dans les 30 premieres secondes du cycle ;
+    etat garde avant le reseau ; erreur disque ou d'envoi : le cycle continue et le direct part quand meme ;
+  - lignes coupees au milieu d'un caractere tolerees ; evenements et lignes minute ecrits en ASCII ;
+  - MPP branche en USB direct (hidraw) detecte en automatique (PI30 seulement sur ces prises) ;
+  - aucune detection hors du verrou ; --sante, --show, --evenements ne touchent pas aux cables ;
+  - --test joue 3 cycles complets dans un dossier temporaire (une mise a jour cassee est refusee et retiree) ;
+  - temperature du boitier : 75 C a la montee, 70 C a la descente ; 6 h sans internet -> redemarrage (1 fois / 12 h).
 v1.6b (26/11 21h, banc, SRNE HYP4860S100-H 6,2 kVA) : ADRESSE MODBUS DU SRNE. Ce SRNE etait regle sur l'adresse 2
   (ecran « Id: 2 », M) ; la detection ne l'essayait qu'a l'adresse 1 -> non reconnu (M 20h56). Desormais, a la
   detection, adresses 1 a 9 essayees une par une (Felicity 0x1100 puis SRNE 0x0100, lecture seule fonction 03) ;
@@ -128,7 +141,7 @@ sys.path.insert(0, ICI)
 import felicity_collect as fc      # stockage, rattrapage, envoi (v1.7)
 import mpp_probe as mp             # trame, CRC, liaison serie / USB (v1.1)
 
-VERSION = "mpp 1.7a"
+VERSION = "mpp 1.7b"
 SRNE = [("batterie_soc_pct", 0x0100, False, 1), ("batterie_tension_v", 0x0101, False, 10),
         ("batterie_courant_a", 0x0102, True, 10), ("pv1_tension_v", 0x0107, False, 10),
         ("pv1_courant_a", 0x0108, False, 10), ("pv1_puissance_w", 0x0109, False, 1),
@@ -203,7 +216,7 @@ def prises():
         if reel not in vues:
             vues.add(reel)
             out.append(os.path.join(d, n))
-    for reel in sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")):
+    for reel in sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*") + glob.glob("/dev/hidraw*")):   # v1.7b : MPP en USB direct
         if reel not in vues:
             vues.add(reel)
             out.append(reel)
@@ -221,6 +234,8 @@ def identifier(port):
             return "MPP"
     except OSError:
         pass
+    if "hidraw" in port:                               # v1.7b : prise USB directe = PI30 seulement
+        return None
     fc.PORT = port
     try:
         fd = fc.ouvrir()
@@ -321,7 +336,7 @@ def detecter(forcer=False):
     if not forcer and os.path.exists(p):
         try:
             d = json.load(open(p))
-            if d.get("prises") == liste and "cles" in d and "unites" in d:
+            if d.get("prises") == liste and "cles" in d and "unites" in d and d.get("convertisseurs"):   # v1.7b
                 CLES = d["cles"]
                 UNITES_PRISE = d["unites"]
                 return [tuple(c) for c in d["convertisseurs"]]
@@ -352,6 +367,19 @@ def detecter(forcer=False):
             unites[port] = adresses_felicity(port)
         elif m == "SRNE":
             unites[port] = [ADR_SRNE.get(port, 1)]          # v1.6b : adresse gardee pour la lecture
+    # v1.7b (relecture contradictoire) : un convertisseur muet au moment d'une detection forcee n'est JAMAIS retire
+    # tant que sa prise existe (sinon boitier aveugle pour toujours) ; il reste lu, absent signale, auto-guerison active
+    anc = fc.lire_json(p, {}) or {}
+    pris_ports = [c[1] for c in conv]
+    for c in anc.get("convertisseurs") or []:
+        if c[1] in liste and c[1] not in pris_ports and c[0] not in [x[0] for x in conv]:
+            conv.append(tuple(c))
+            if c[1] in (anc.get("cles") or {}):
+                cles[c[1]] = anc["cles"][c[1]]
+            if c[1] in (anc.get("unites") or {}):
+                unites[c[1]] = anc["unites"][c[1]]
+                if c[2] == "SRNE":
+                    ADR_SRNE.setdefault(c[1], (anc["unites"][c[1]] or [1])[0])
     conv.sort(key=lambda c: c[0])
     os.makedirs(fc.DATA, exist_ok=True)
     fc.ecrire_json(os.path.join(fc.DATA, "identites.json"), ids)            # v1.7 : ecritures protegees
@@ -544,7 +572,7 @@ def releve_plusieurs(rec, deja=False):
         recent = time.time() - os.path.getmtime(marque_det) < 600
     except OSError:
         recent = False
-    if AUTO and not deja and not recent and any(statuts[c[0]] != "OK" and os.path.exists(c[1]) for c in CONVERTISSEURS):
+    if AUTO and not deja and not recent and time.time() - T0 < 30 and any(statuts[c[0]] != "OK" and os.path.exists(c[1]) for c in CONVERTISSEURS):
         try:
             os.makedirs(fc.RUN, exist_ok=True)
             open(marque_det, "w").close()
@@ -619,8 +647,8 @@ def lire_port(port, rec, unites):
         rec["brut"] = brut
         return rec
     val = depuis_qpigs(brut["QPIGS"])
-    m = brut.get("QMOD", "")
-    val["mode_brut"] = m[1:2] if m.startswith("(") else ""
+    m = brut.get("QMOD", "") if ctrl.get("QMOD") else ""          # v1.7b : seulement si la trame est controlee
+    val["mode_brut"] = m[1:2] if m.startswith("(") and not m.startswith("(NAK") else ""
     q2 = brut.get("QPIGS2", "")
     if q2.startswith("(") and not q2.startswith("(NAK"):
         xs = q2[1:].split()
@@ -631,8 +659,9 @@ def lire_port(port, rec, unites):
             val["pv%s_brut_w" % i] = val["pv%s_puissance_w" % i]
             val["pv%s_puissance_w" % i] = 0
     val["pv_w"] = round((val.get("pv1_puissance_w") or 0) + (val.get("pv2_puissance_w") or 0))
-    w = brut.get("QPIWS", "")
-    val["avertissements"] = w[1:] if w.startswith("(") else ""
+    w = brut.get("QPIWS", "") if ctrl.get("QPIWS") else ""
+    if w.startswith("(") and not w.startswith("(NAK"):
+        val["avertissements"] = w[1:]                 # v1.7b : absent si trame abimee (pas de faux evenement)
     if unites > 1:
         par = {}
         for i in range(unites):
@@ -666,6 +695,7 @@ def lire_port(port, rec, unites):
 #   reglages et drapeaux MPP), gardee brute ; un changement produit un evenement.
 # ---------------------------------------------------------------------------------------------------------------
 MESURE_S, COMPLET_S = 60, 300
+T0 = time.time()                                  # v1.7b : debut du cycle (budget de temps)
 ETAT_RAM = os.path.join(fc.RUN, "etat.json")
 MINUTES_RAM = os.path.join(fc.RUN, "minutes.jsonl")
 MPP_MEMOIRE = ("QPIRI", "QFLAG", "QVFW", "QBEQI")
@@ -675,7 +705,7 @@ SRNE_MEMOIRE = ((0xF800, 32), (0xF820, 32), (0xF840, 32), (0xF860, 32), (0xE000,
 TYPES_EVENEMENTS = ("demarrage_boitier", "heure_synchronisee", "coupure_reseau", "retour_reseau", "changement_mode",
                     "avertissement", "convertisseur_absent", "convertisseur_retour", "detection_refaite",
                     "journal_defauts", "reglages_modifies", "temperature_boitier", "disque_presque_plein",
-                    "usb_reinitialise", "redemarrage_auto")                                     # v1.7a
+                    "usb_reinitialise", "redemarrage_auto", "reseau_perdu")                     # v1.7a / v1.7b
 
 
 def p_data(n):
@@ -752,7 +782,7 @@ def ecrire_evenements(evs, rec, etat):
     """Evenements ecrits tout de suite sur le disque (rares, importants)."""
     if not evs:
         return []
-    seq = etat.get("seq") or evenement_seq()
+    seq = max(etat.get("seq") or 0, evenement_seq())          # v1.7b : pas de doublon apres cycle interrompu
     out = []
     for e in evs:
         seq += 1
@@ -762,7 +792,7 @@ def ecrire_evenements(evs, rec, etat):
         out.append(x)
     etat["seq"] = seq
     try:
-        fc.ajouter_lignes(p_data("evenements.jsonl"), [json.dumps(x, ensure_ascii=False) for x in out])
+        fc.ajouter_lignes(p_data("evenements.jsonl"), [json.dumps(x, ensure_ascii=True) for x in out])
     except OSError:
         pass
     return out
@@ -776,7 +806,7 @@ def a_envoyer_evenements(n=20):
         return []
     out = []
     try:
-        for l in open(p, encoding="utf-8"):
+        for l in open(p, encoding="utf-8", errors="replace"):
             try:
                 e = json.loads(l)
             except ValueError:
@@ -826,12 +856,17 @@ def detecter_evenements(rec, etat, premier):
             evs.append({"type": "heure_synchronisee"})
     if rec.get("detection"):
         evs.append({"type": "detection_refaite", "raison": rec["detection"]})
-    anc = etat.get("conv") or {}
+    anc = {k: dict(x) for k, x in (etat.get("conv") or {}).items()}
     nouv = {}
     for nom, v in par_conv(rec).items():
         r = resume(v)
-        nouv[nom] = r
         a = anc.get(nom)
+        if a and r["ok"]:                             # v1.7b : reponse abimee (pas de mode / d'avertissement valide)
+            if not r["mode"]:
+                r["mode"] = a.get("mode")
+            if r["avert"] is None:
+                r["avert"] = a.get("avert")
+        nouv[nom] = r
         if not a:
             continue
         pa = {"conv": nom}
@@ -855,6 +890,7 @@ def detecter_evenements(rec, etat, premier):
     for nom in anc:
         if nom not in nouv and anc[nom].get("ok"):
             evs.append({"type": "convertisseur_absent", "conv": nom, "statut": "plus_detecte"})
+            anc[nom]["ok"] = 0                        # v1.7b : une seule fois (et non chaque minute)
     etat["conv"] = dict(anc, **nouv) if not premier else nouv
     return evs
 
@@ -889,6 +925,16 @@ def integrer(rec, etat):
     v["energie_jour"] = {k: round(x, 3) for k, x in d.items()}
 
 
+def reporter_energie_nv(rec, etat):
+    """v1.7b : energie comptee avant la synchronisation de l'heure -> ajoutee au jour reel (C)."""
+    E = etat.get("energie") or {}
+    k = "nv-" + (rec.get("boot") or "")[:8]
+    if k in E and rec.get("heure_verifiee"):
+        j = E.setdefault(rec["horodatage"][:10], {})
+        for x, y in E.pop(k).items():
+            j[x] = round(j.get(x, 0) + y, 4)
+
+
 def sauver_energie(etat):
     p = p_data("energie.json")
     tout = fc.lire_json(p, {}) or {}
@@ -901,7 +947,7 @@ def sauver_energie(etat):
 def memoire_du_jour(rec, etat):
     """Lecture seule, une fois par jour : journal des defauts / reglages SRNE, reglages / drapeaux MPP."""
     jour = rec["horodatage"][:10] if rec.get("heure_verifiee") else "boot-" + (rec.get("boot") or "")[:8]
-    if etat.get("memoire_jour") == jour:
+    if etat.get("memoire_jour") == jour or time.time() - T0 > 30:     # v1.7b : budget de temps du cycle
         return []
     etat["memoire_jour"] = jour
     evs = []
@@ -1044,6 +1090,30 @@ def guerir(rec, etat):
     return evs
 
 
+RESEAU_PERDU_H, RESEAU_REDEMARRAGE_ECART_H = 6, 12
+
+
+def surveiller_reseau(rec, etat):
+    """v1.7b (forums Armbian : Wi-Fi integre qui tombe au bout de quelques jours, seul un redemarrage le recupere) :
+    direct en echec depuis 6 h -> evenement reseau_perdu puis redemarrage, au plus une fois toutes les 12 h.
+    Rien ne se perd : les mesures restent sur le disque et partent au rattrapage."""
+    d = rec.get("direct") or ""
+    up = rec.get("uptime_s") or 0
+    if d == "direct=ok" or "non_configure" in d:
+        etat.pop("reseau_ko_up", None)
+        return
+    etat.setdefault("reseau_ko_up", up)
+    if up - etat["reseau_ko_up"] < RESEAU_PERDU_H * 3600:
+        return
+    p = p_data("redemarrage_reseau.json")
+    dern = (fc.lire_json(p, {}) or {}).get("t", 0)
+    if time.time() - dern >= RESEAU_REDEMARRAGE_ECART_H * 3600 or time.time() < dern:
+        fc.ecrire_json(p, {"t": time.time(), "horodatage": rec["horodatage"]})
+        ecrire_evenements([{"type": "reseau_perdu", "depuis_h": round((up - etat["reseau_ko_up"]) / 3600, 1),
+                            "direct": d}], rec, etat)
+        etat["redemarrer"] = 1
+
+
 def ligne_minute(rec):
     v = rec.get("valeurs") or {}
     x = {"t": rec["horodatage"], "hv": rec.get("heure_verifiee"), "up": rec.get("uptime_s"), "boot": rec.get("boot"),
@@ -1063,7 +1133,7 @@ def ligne_minute(rec):
 def vider_minutes():
     """Lignes minute de la periode : de la memoire vive vers le disque, d'un coup."""
     try:
-        lignes = open(MINUTES_RAM, encoding="utf-8").read().splitlines()
+        lignes = open(MINUTES_RAM, encoding="utf-8", errors="replace").read().splitlines()
     except OSError:
         return 0
     par = {}
@@ -1099,11 +1169,16 @@ def cycle(t0, force=False, envoyer=True):
         etat = fc.lire_json(p_data("etat_persistant.json"), {}) or {}
         etat = {"conv": etat.get("conv") or {}, "seq": evenement_seq(), "boot": fc.boot_id()[:8],
                 "memoire_jour": None}
+    global T0, CONVERTISSEURS
+    T0 = t0
     up = fc.uptime_s() or 0
     if not force and etat.get("m_up") is not None and up - etat["m_up"] < MESURE_S - 15:
         return None                                       # cadence reglee plus lente que le minuteur
+    if premier and AUTO:                                  # v1.7b : detection refaite a chaque demarrage
+        CONVERTISSEURS = detecter(forcer=True)
+    hv = 1 if fc.horloge_ok() else 0                      # v1.7b : heure testee AVANT la lecture
     rec = releve()
-    rec["heure_verifiee"] = 1 if fc.horloge_ok() else 0
+    rec["heure_verifiee"] = hv
     rec["boot"], rec["uptime_s"] = etat["boot"], fc.uptime_s()
     evs = detecter_evenements(rec, etat, premier)
     evs += guerir(rec, etat)                              # v1.7a
@@ -1116,8 +1191,8 @@ def cycle(t0, force=False, envoyer=True):
         evs += memoire_du_jour(rec, etat)
         s = sante(t0)
         h = etat.setdefault("alertes_sante", {})
-        if s.get("cpu_c") and (s["cpu_c"] >= 75) != bool(h.get("cpu")):
-            h["cpu"] = s["cpu_c"] >= 75
+        if s.get("cpu_c") and ((not h.get("cpu") and s["cpu_c"] >= 75) or (h.get("cpu") and s["cpu_c"] < 70)):
+            h["cpu"] = s["cpu_c"] >= 75                  # v1.7b : 75 C a la montee, 70 C a la descente
             evs.append({"type": "temperature_boitier", "cpu_c": s["cpu_c"], "etat": "haute" if h["cpu"] else "normale"})
         if s.get("disque_libre_pct") is not None and (s["disque_libre_pct"] < 10) != bool(h.get("disque")):
             h["disque"] = s["disque_libre_pct"] < 10
@@ -1126,22 +1201,34 @@ def cycle(t0, force=False, envoyer=True):
     ecrits = ecrire_evenements(evs, rec, etat)
     if ecrits:
         rec["evenements_nouveaux"] = [e["type"] + (":" + e["conv"] if e.get("conv") else "") for e in ecrits]
-    fc.ajouter_lignes(MINUTES_RAM, [json.dumps(ligne_minute(rec), ensure_ascii=False)])
+    fc.ajouter_lignes(MINUTES_RAM, [json.dumps(ligne_minute(rec), ensure_ascii=True)])
     fc.ecrire_json(os.path.join(fc.RUN, "dernier.json"), rec)
     if complet:
         etat["c_up"] = up
-        vider_minutes()
-        fc.recaler()
-        fc.sauver(rec)
+        try:                                              # v1.7b : disque plein ou en lecture seule -> direct quand meme
+            vider_minutes()
+            if fc.recaler():
+                reporter_energie_nv(rec, etat)
+            fc.sauver(rec)
+            sauver_energie(etat)
+            fc.ecrire_json(p_data("etat_persistant.json"), {"conv": etat.get("conv"), "seq": etat.get("seq"),
+                                                             "horodatage": rec["horodatage"]})
+        except OSError as e:
+            rec.setdefault("sante", {})["erreur_disque"] = "%s %s" % (e.__class__.__name__, getattr(e, "errno", ""))
         rec["evenements"] = a_envoyer_evenements()
-        sauver_energie(etat)
-        fc.ecrire_json(p_data("etat_persistant.json"), {"conv": etat.get("conv"), "seq": etat.get("seq"),
-                                                         "horodatage": rec["horodatage"]})
+        fc.ecrire_json(ETAT_RAM, etat)                    # v1.7b : etat garde avant le reseau
         if envoyer:
-            rec["direct"] = fc.envoyer_direct(rec)
-            accuser_evenements()
-            # campagne au banc (fichier DATA/BANC) : pas d'historique horaire sous le code du site client
-            rec["envoi"] = "envoi=banc" if os.path.exists(p_data("BANC")) else fc.envoyer(rec)
+            try:                                          # v1.7b : une erreur d'envoi ne tue jamais le cycle
+                rec["direct"] = fc.envoyer_direct(rec)
+                accuser_evenements()
+            except Exception as e:
+                rec["direct"] = "direct=erreur(%s)" % e.__class__.__name__
+            surveiller_reseau(rec, etat)                  # v1.7b
+            try:
+                # campagne au banc (fichier DATA/BANC) : pas d'historique horaire sous le code du site client
+                rec["envoi"] = "envoi=banc" if os.path.exists(p_data("BANC")) else fc.envoyer(rec)
+            except Exception as e:
+                rec["envoi"] = "envoi=erreur(%s)" % e.__class__.__name__
         rec.pop("evenements", None)
     if etat.pop("redemarrer", None):                      # v1.7a : dernier recours, tout est deja ecrit
         vider_minutes()
@@ -1151,6 +1238,26 @@ def cycle(t0, force=False, envoyer=True):
     fc.ecrire_json(ETAT_RAM, etat)
     rec["complet"] = 1 if complet else 0
     return rec
+
+
+def tester_cycle():
+    """v1.7b : --test (mise a jour automatique) joue 3 cycles complets dans un dossier temporaire, sans cable."""
+    import tempfile
+    global ETAT_RAM, MINUTES_RAM, CONVERTISSEURS
+    d = tempfile.mkdtemp(prefix="opti_test_")
+    fc.DATA, fc.RUN = os.path.join(d, "data"), os.path.join(d, "run")
+    ETAT_RAM, MINUTES_RAM = os.path.join(fc.RUN, "etat.json"), os.path.join(fc.RUN, "minutes.jsonl")
+    CONVERTISSEURS = []
+    fc.horloge_ok = lambda: True
+    globals()["releve"] = lambda: {"site": "TEST", "horodatage": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+                                   "version": VERSION, "statut": "OK",
+                                   "valeurs": {"pv_w": 100, "charge_puissance_w": 200, "batterie_puissance_w": -100}}
+    for _ in range(3):
+        r = cycle(time.time(), force=True, envoyer=False)
+        assert r and r.get("complet") == 1, r
+    assert os.path.exists(os.path.join(fc.DATA, "dernier.json")) and os.path.exists(os.path.join(fc.DATA, "energie.json"))
+    import shutil
+    shutil.rmtree(d, ignore_errors=True)
 
 
 def verrou():
@@ -1169,7 +1276,8 @@ def verrou():
 
 def main():
     fc.releve = releve                            # le reste du cycle (stockage, envoi, direct) est celui de v1.7
-    if "--test" in sys.argv:                     # v1.7 : test apres mise a jour automatique (aucun cable touche)
+    if "--test" in sys.argv:
+        tester_cycle()                     # v1.7 : test apres mise a jour automatique (aucun cable touche)
         v = srne_valeurs({0x0100: [80, 532, 65524] + [0] * 13, 0x0210: [4] + [0] * 15})
         assert v and v["batterie_tension_v"] == 53.2 and v["batterie_courant_a"] == 1.2, v
         v = srne_valeurs({0x0100: [80, 532, 65524] + [0] * 13, 0x0210: [5] + [0] * 15})
@@ -1177,7 +1285,9 @@ def main():
         assert depuis_qpigs is not None and fc.ecrire_json and fc.recaler and cycle
         print("test", VERSION, "OK")
         return
-    regler()
+    if not any(a in sys.argv for a in ("--show", "--evenements", "--sante")):
+        garde = verrou()                          # v1.7b : aucune detection hors du verrou
+        regler()
     if "--detecter" in sys.argv:                 # v1.4 : pour le technicien / l'atelier
         for nom, port, marque in detecter(forcer=True):
             cle = CLES.get(port, "")
@@ -1202,7 +1312,7 @@ def main():
         return
     if "--evenements" in sys.argv:               # v1.7 : 30 derniers evenements
         p = p_data("evenements.jsonl")
-        for l in (open(p, encoding="utf-8").read().splitlines()[-30:] if os.path.exists(p) else []):
+        for l in (open(p, encoding="utf-8", errors="replace").read().splitlines()[-30:] if os.path.exists(p) else []):
             try:
                 e = json.loads(l)
             except ValueError:
@@ -1216,7 +1326,6 @@ def main():
             print("  %-20s %s" % (k, x))
         print("  %-20s %s" % ("heure_verifiee", fc.horloge_ok()))
         return
-    garde = verrou()                              # v1.1
     t0 = time.time()
     rec = cycle(t0, force="--sans-envoi" in sys.argv or "--complet" in sys.argv, envoyer="--sans-envoi" not in sys.argv)
     if rec is None:

@@ -1,5 +1,5 @@
 #!/bin/sh
-# OPTI-MIST SOLUTIONS - campagne de validation au banc du lecteur universel v1.7 - v2.1 du 27/11/2026 (v2.1 : commande redemarrage, scenario 8b)
+# OPTI-MIST SOLUTIONS - campagne de validation au banc du lecteur universel v1.7 - v2.2 du 27/11/2026 (v2.2 : fin eteint le boitier sans relancer la mesure, bilan controle la mise a jour a distance ; v2.1 : scenario 8b)
 # GO S.S. 26/11 22h50 : tout est valide au banc avant la pose du 28/11 (un boitier pose ne revient plus au banc).
 # Lecture seule des convertisseurs. Un seul script par boitier, 4 commandes :
 #   sh /root/campagne_v2.sh prepare   installe la v1.7 depuis /root (install_universel v1.1), controle l'installation,
@@ -185,6 +185,14 @@ for m in mem:
     b = json.load(open(m)).get("brut") or {}
     print("   %s : %s" % (os.path.basename(m), ", ".join("%s(%d)" % (k, len(x)) for k, x in b.items())))
 ctl(len(mem) >= 1, "memoire lue (journal des defauts SRNE / reglages MPP)")
+try:
+    mc = open("/etc/opti-maj/maj.conf").read()
+except OSError:
+    mc = ""
+manque = [c for c in ("mpp_collect.py", "mpp_probe.py", "felicity_collect.py") if "[composant:%s]" % c not in mc]
+ctl(not manque, "mise a jour a distance : composants installes%s" % (" - MANQUE " + ", ".join(manque) if manque else " (3/3)"))
+ctl(os.path.exists("/etc/systemd/system/opti-maj.timer") or os.path.exists("/etc/systemd/system/optimaj.timer") or
+    "opti-maj" in os.popen("systemctl list-timers --all --no-pager 2>/dev/null").read(), "mise a jour a distance : minuteur present")
 print("=== RESULTAT : %s (%d VERT / %d)" % ("VERT" if all(res) else "ROUGE", sum(res), len(res)))
 EOP
   } > "$F" 2>&1
@@ -192,11 +200,15 @@ EOP
   echo "=== bilan ecrit dans $F (a copier sur le PC et a envoyer)"
   ;;
 fin)
-  systemctl stop opti-mpp.timer
+  # v2.2 : la mesure n'est PAS relancee au banc (sinon detection, noms et unites du banc gardes chez le client) ;
+  # le boitier s'eteint ; il repart seul a la mise sous tension sur le site, avec une detection neuve.
+  systemctl stop opti-mpp.timer opti-mpp.service 2>/dev/null
   rm -rf "${D:?}"/* /run/opti061
   sysctl -q -p /etc/sysctl.d/90-opti.conf 2>/dev/null
-  systemctl start opti-mpp.timer
-  echo "=== $H - donnees d'essai effacees, marquage BANC retire : pret pour la pose ($(date '+%d/%m %T'))"
+  systemctl is-enabled opti-mpp.timer >/dev/null 2>&1 || systemctl enable opti-mpp.timer >/dev/null 2>&1
+  echo "=== $H - donnees d'essai effacees, marquage BANC retire ; mesure active au prochain demarrage."
+  echo "    Le boitier s'eteint dans 10 s : debrancher ensuite, il est pret pour la pose ($(date '+%d/%m %T'))"
+  sync; sleep 10; systemctl poweroff
   ;;
 *) echo "Usage : sh campagne_v2.sh prepare | suivi | blocage | redemarrage | bilan | fin" ;;
 esac

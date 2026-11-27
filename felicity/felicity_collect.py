@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OPTI-MIST SOLUTIONS - Pilote Felicity IVEM (RS232/RS485, Modbus RTU 9600 8N1) - v1.8 du 27/11/2026
+OPTI-MIST SOLUTIONS - Pilote Felicity IVEM (RS232/RS485, Modbus RTU 9600 8N1) - v1.8b du 27/11/2026
+v1.8b (27/11 01h, relecture contradictoire) : recalage des lignes minute (champs up / t) et renommage seulement si quelque
+  chose a ete recale ; lecture tolerante aux lignes coupees au milieu d'un caractere (errors=replace), ecriture en ASCII ;
+  envoi horaire au plus 2 lots par passage et 40 s au plus (le reste aux passages suivants).
 v1.8 (27/11, GO S.S. 26/11 22h50, boitiers poses le 28/11 sans retour au banc ; audit du 26/11) : FONDATIONS.
   - ECRITURES PROTEGEES : dernier.json, envoi_etat.json et tous les fichiers d'etat sont ecrits dans un fichier
     temporaire, forces sur le disque (fsync), puis mis en place d'un coup (os.replace) : une coupure de courant
@@ -315,23 +318,26 @@ def recaler():
         p = os.path.join(DATA, "%snv-%s.jsonl" % (prefixe, b))
         if not os.path.exists(p):
             continue
-        par_jour = {}
-        for l in open(p, encoding="utf-8"):
+        par_jour, k = {}, 0
+        for l in open(p, encoding="utf-8", errors="replace"):
             try:
                 r = json.loads(l)
-                u = float(r["uptime_s"])
+                u = float(r["uptime_s"] if "uptime_s" in r else r["up"])     # v1.8b : releves complets ET lignes minute
             except Exception:
                 continue
-            reel = maint - dt.timedelta(seconds=max(0.0, up - u))
-            r["horodatage_brut"] = r.get("horodatage")
-            r["horodatage"] = reel.isoformat(timespec="seconds")
-            r["heure_verifiee"] = 2                         # recalee (C)
-            par_jour.setdefault(os.path.join(DATA, prefixe + r["horodatage"][:10] + ".jsonl"), []).append(
-                json.dumps(r, ensure_ascii=False))
-            n += 1
+            reel = (maint - dt.timedelta(seconds=max(0.0, up - u))).isoformat(timespec="seconds")
+            if "t" in r and "horodatage" not in r:
+                r["t_brut"], r["t"], r["hv"] = r["t"], reel, 2
+            else:
+                r["horodatage_brut"], r["horodatage"], r["heure_verifiee"] = r.get("horodatage"), reel, 2   # recalee (C)
+            par_jour.setdefault(os.path.join(DATA, prefixe + reel[:10] + ".jsonl"), []).append(
+                json.dumps(r, ensure_ascii=True))
+            k += 1
         for f, lignes in par_jour.items():
             ajouter_lignes(f, lignes)
-        os.replace(p, p + ".recale")
+        if k:
+            os.replace(p, p + ".recale")                # v1.8b : renomme seulement si quelque chose est recale
+        n += k
     return n
 
 
@@ -350,7 +356,7 @@ def purger():
 
 def sauver(rec):
     os.makedirs(DATA, exist_ok=True)
-    ajouter_lignes(fichier_stock(rec), [json.dumps(rec, ensure_ascii=False)])      # v1.8
+    ajouter_lignes(fichier_stock(rec), [json.dumps(rec, ensure_ascii=True)])       # v1.8 ; v1.8b : ASCII
     ecrire_json(os.path.join(DATA, "dernier.json"), rec)                            # v1.8 : protege
     purger()
 
@@ -439,7 +445,7 @@ def releves_par_heure(depuis):
     for n in sorted(os.listdir(DATA)):
         if not n.endswith(".jsonl") or len(n) != 16 or n[:2] != "20" or n[:10] < depuis[:10]:
             continue                # v1.8 : fichiers du jour seulement (ni minutes, ni releves a recaler)
-        for l in open(os.path.join(DATA, n), encoding="utf-8"):
+        for l in open(os.path.join(DATA, n), encoding="utf-8", errors="replace"):
             try:
                 r = json.loads(l)
                 h = heure(dt.datetime.fromisoformat(r["horodatage"]))
@@ -478,11 +484,15 @@ def envoyer(rec):
     a_envoyer = sorted(releves_par_heure(derniere).items())
     if not a_envoyer:
         return "envoi=rien"
-    envoyees = 0
+    envoyees, debut = 0, time.time()
     a_envoyer = a_envoyer[:LOT * MAX_LOTS]        # v1.7
+    if len(a_envoyer) > LOT and os.environ.get("OPTI_BUDGET_ENVOI") != "0":
+        a_envoyer = a_envoyer[:LOT * 2]           # v1.8b : au plus 2 lots par passage (budget de temps du cycle)
     for i in range(0, len(a_envoyer), LOT):
         lot = a_envoyer[i:i + LOT]
         try:
+            if time.time() - debut > 40:
+                break                             # v1.8b : le reste au passage suivant
             req = urllib.request.Request(cfg["url"], data=json.dumps({"rows": [ligne_historique(r, cfg) for _, r in lot],
                                          "deduplicate": True}).encode(), headers={"Content-Type": "application/json"})
             res = json.loads(urllib.request.urlopen(req, timeout=30).read().decode("utf-8"))
