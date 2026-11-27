@@ -29,6 +29,10 @@ v1.7a (27/11 00h, veille forums Solar Assistant / Armbian / Victron, GO S.S. 26/
   du boitier (evenement redemarrage_auto), au plus une fois toutes les 6 h. Rien n'est envoye au convertisseur.
   Nouvelle detection sur convertisseur muet : au plus une fois toutes les 10 min (elle dure 40 a 90 s ; chaque minute,
   elle aurait empeche la mesure des autres convertisseurs, C).
+v1.7f (27/11 17h20, OPTI-108 en v1.7d a 16:34 mais sans diagnostic, M) : le diagnostic n'etait envoye que si le releve
+  avait dure moins de 25 s ; avec plusieurs convertisseurs absents (essais sans reponse) ce delai etait depasse et le
+  diagnostic sautait justement quand il manque quelqu'un. Desormais il part toujours : essais seulement dans le temps
+  restant (sinon diagnostic leger : prises, adaptateurs, detection, noms vus), et la duree du releve est jointe.
 v1.7e (27/11 17h05, GO S.S. 17h04, cas OPTI-108 « 2 / 8 » et OPTI-098 « 3 / 4 » apres la pose) : NOMS FANTOMES. Un nom
   lu quelques minutes pendant une pose (changements de cablage) restait « attendu » 7 jours (fausses alertes « absent »).
   Desormais un nom n'est attendu que s'il a ete lu au moins 60 fois (60 min) ou s'il fait partie des convertisseurs
@@ -158,7 +162,7 @@ sys.path.insert(0, ICI)
 import felicity_collect as fc      # stockage, rattrapage, envoi (v1.7)
 import mpp_probe as mp             # trame, CRC, liaison serie / USB (v1.1)
 
-VERSION = "mpp 1.7e"
+VERSION = "mpp 1.7f"
 SRNE = [("batterie_soc_pct", 0x0100, False, 1), ("batterie_tension_v", 0x0101, False, 10),
         ("batterie_courant_a", 0x0102, True, 10), ("pv1_tension_v", 0x0107, False, 10),
         ("pv1_courant_a", 0x0108, False, 10), ("pv1_puissance_w", 0x0109, False, 1),
@@ -1327,9 +1331,11 @@ def cycle(t0, force=False, envoyer=True):
             manque = (v.get("convertisseurs_lus") is not None and v.get("convertisseurs_attendus") is not None
                       and v["convertisseurs_lus"] < v["convertisseurs_attendus"]) or rec.get("statut") != "OK" \
                      or len(prises()) > len(CONVERTISSEURS or [])
-            if manque and (premier or up - (etat.get("diag_up") or -1e9) >= DIAG_PERIODE_S) and time.time() - t0 < 25:
-                s["diag"] = diagnostic_prises(rec)
-                etat["diag_up"] = up
+            if manque and (premier or up - (etat.get("diag_up") or -1e9) >= DIAG_PERIODE_S):
+                reste = max(0.0, min(10.0, 32.0 - (time.time() - t0)))    # v1.7f : jamais saute, essais dans le temps restant
+                s["diag"] = diagnostic_prises(rec, budget_s=reste)
+                s["diag"]["releve_s"] = round(time.time() - t0, 1)
+                etat["diag_up"] = up if reste >= 6 else up - DIAG_PERIODE_S + 300   # leger : essais complets 5 min apres
         except Exception as e:
             s["diag_erreur"] = type(e).__name__
     ecrits = ecrire_evenements(evs, rec, etat)
