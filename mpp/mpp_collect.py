@@ -29,6 +29,11 @@ v1.7a (27/11 00h, veille forums Solar Assistant / Armbian / Victron, GO S.S. 26/
   du boitier (evenement redemarrage_auto), au plus une fois toutes les 6 h. Rien n'est envoye au convertisseur.
   Nouvelle detection sur convertisseur muet : au plus une fois toutes les 10 min (elle dure 40 a 90 s ; chaque minute,
   elle aurait empeche la mesure des autres convertisseurs, C).
+v1.7e (27/11 17h05, GO S.S. 17h04, cas OPTI-108 « 2 / 8 » et OPTI-098 « 3 / 4 » apres la pose) : NOMS FANTOMES. Un nom
+  lu quelques minutes pendant une pose (changements de cablage) restait « attendu » 7 jours (fausses alertes « absent »).
+  Desormais un nom n'est attendu que s'il a ete lu au moins 60 fois (60 min) ou s'il fait partie des convertisseurs
+  detectes ; vus.json garde le nombre de lectures. Le diagnostic des prises joint aussi la detection (nom, prise, type,
+  adresses Modbus) et la memoire des noms vus, pour comprendre a distance un comptage anormal.
 v1.7d (27/11 16h, GO S.S. 15h54, cas OPTI-098 CREUSET : Felicity jamais reconnu, 2 convertisseurs sur 3) :
   DIAGNOSTIC DES PRISES A DISTANCE, sans port ouvert : quand un convertisseur attendu manque ou qu'une prise ne donne
   rien, le releve complet joint (sante.diag, au plus toutes les 30 min) pour chaque prise : adaptateur USB (fabricant,
@@ -153,7 +158,7 @@ sys.path.insert(0, ICI)
 import felicity_collect as fc      # stockage, rattrapage, envoi (v1.7)
 import mpp_probe as mp             # trame, CRC, liaison serie / USB (v1.1)
 
-VERSION = "mpp 1.7d"
+VERSION = "mpp 1.7e"
 SRNE = [("batterie_soc_pct", 0x0100, False, 1), ("batterie_tension_v", 0x0101, False, 10),
         ("batterie_courant_a", 0x0102, True, 10), ("pv1_tension_v", 0x0107, False, 10),
         ("pv1_courant_a", 0x0108, False, 10), ("pv1_puissance_w", 0x0109, False, 1),
@@ -295,22 +300,29 @@ def serie(port, marque):
     return None
 
 
-def absents_7j(lus):
-    """v1.5c : met a jour DATA/vus.json (nom -> derniere lecture) ; renvoie les noms lus < 7 j et absents maintenant."""
+def absents_7j(lus, detectes=()):
+    """v1.5c : met a jour DATA/vus.json ; renvoie les noms attendus et absents maintenant.
+    v1.7e : vus.json = nom -> {t: derniere lecture, n: nombre de lectures} ; un nom n'est attendu que s'il a ete lu
+    au moins VUS_MIN fois (60 min) ou s'il est detecte : les noms de pose (cablage change) ne creent plus d'alerte."""
     p = os.path.join(fc.DATA, "vus.json")
     try:
         vus = json.load(open(p))
     except (OSError, ValueError):
         vus = {}
+    vus = {n: (x if isinstance(x, dict) else {"t": x, "n": 0}) for n, x in vus.items()}   # ancien format v1.5c
     maintenant = time.time()
     for n in lus:
-        vus[n] = maintenant
-    vus = {n: t for n, t in vus.items() if maintenant - t < 7 * 86400}
+        x = vus.get(n) or {"t": maintenant, "n": 0}
+        vus[n] = {"t": maintenant, "n": min(int(x.get("n") or 0) + 1, 10 ** 6)}
+    vus = {n: x for n, x in vus.items() if maintenant - (x.get("t") or 0) < 7 * 86400}
     try:
         fc.ecrire_json(p, vus)                    # v1.7 : ecriture protegee
     except OSError:
         pass
-    return sorted(n for n in vus if n not in lus)
+    return sorted(n for n, x in vus.items() if n not in lus and ((x.get("n") or 0) >= VUS_MIN or n in detectes))
+
+
+VUS_MIN = 60
 
 
 def adresses_felicity(port):
@@ -627,7 +639,7 @@ def releve_plusieurs(rec, deja=False):
                                     for c in CONVERTISSEURS if c[0] in ok)
     val["convertisseurs_attendus"] = sum(unit(c) for c in CONVERTISSEURS)
     if AUTO:                                      # v1.5c : qui manque par rapport aux 7 derniers jours ?
-        absents = absents_7j(ok)
+        absents = absents_7j(ok, [c[0] for c in CONVERTISSEURS])
         if absents:
             val["absents"] = ", ".join(absents)
             val["alerte"] = ((val.get("alerte") + " ; ") if val.get("alerte") else "") + \
@@ -1159,7 +1171,12 @@ def diagnostic_prises(rec, budget_s=10.0):
         else:
             x["verdict"] = "octets_illisibles"         # vitesse ou protocole different
         out.append(x)
-    return {"t": rec.get("horodatage"), "version": VERSION, "duree_s": round(time.time() - t0, 1), "prises": out}
+    det = [[c[0], os.path.basename(c[1])[-40:], c[2], UNITES_PRISE.get(c[1])] for c in CONVERTISSEURS or []]   # v1.7e
+    vus = fc.lire_json(os.path.join(fc.DATA, "vus.json"), {}) or {}
+    vus = {n: (x.get("n") if isinstance(x, dict) else "ancien") for n, x in vus.items()}
+    v = rec.get("valeurs") or {}
+    return {"t": rec.get("horodatage"), "version": VERSION, "duree_s": round(time.time() - t0, 1), "prises": out,
+            "detection": det, "vus": vus, "lus": v.get("convertisseurs_lus"), "attendus": v.get("convertisseurs_attendus")}
 
 
 def guerir(rec, etat):
